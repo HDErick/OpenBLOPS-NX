@@ -1,4 +1,4 @@
-# OpenBLOPS-NX
+0# OpenBLOPS-NX
 
 OpenBLOPS-NX is a source reconstruction of **Black Ops** for Windows PC and Nintendo Switch. Campaign, Multiplayer, and Zombies are playable, including the base-game and DLC Zombies maps.
 
@@ -22,7 +22,7 @@ Online server discovery and public listings require a community directory endpoi
 
 ## Credits
 
-- **Multiplayer implementation** came from SwagSoftware's [KisakBlack](https://github.com/SwagSoftware/KisakBlack).
+- **Multiplayer implementation** came from SwagSoftware.
 - **Initial base-game Zombies implementation** by [femboyvalve](https://github.com/femboyvalve).
 - **Zombies DLC and the full single-player Campaign implementation** by [NaGaa95](https://github.com/NaGaa95/), who also contributed the original devkitPro scaffolding and mesa-switch work.
 - **Installer idea and compression techniques** by [Chansey](https://github.com/ChanseyIsTheBest), [xsaja](https://github.com/xsaja) and [StevensND](https://github.com/StevensND).
