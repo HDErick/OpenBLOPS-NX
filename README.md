@@ -23,6 +23,7 @@ Online server discovery and public listings require a community directory endpoi
 - **Multiplayer implementation** came from SwagSoftware's [KisakBlack](https://github.com/SwagSoftware/KisakBlack).
 - **Initial base-game Zombies implementation** by [femboyvalve](https://github.com/femboyvalve).
 - **Zombies DLC and the full single-player Campaign implementation** by [NaGaa95](https://github.com/NaGaa95/), who also contributed the original devkitPro scaffolding and mesa-switch work.
+- **Installer idea and compression techniques** by [Chansey](https://github.com/ChanseyIsTheBest), [xsaja](https://github.com/xsaja) and [StevensND](https://github.com/StevensND).
 - The Switch shader translator adapts work from the [KisakBlack WebGL port](https://github.com/riicchhaarrd/KisakBlack/tree/web-port).
 - Thanks to the original Black Ops developers and the [KisakBlack upstream contributors](https://github.com/SwagSoftware/KisakBlack#credits).
 
