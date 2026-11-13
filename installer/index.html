@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenBLOPS-NX Installer</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="platform">Nintendo Switch</p>
+      <h1>OpenBLOPS-NX</h1>
+      <p>Install Campaign, Zombies, and Multiplayer from your own PC copy of Call of Duty: Black Ops.</p>
+    </header>
+    <section class="setup" aria-label="Installer setup">
+      <div class="step">
+        <div><h2>Black Ops folder</h2><p id="source-label">Choose the PC folder containing main and zone.</p></div>
+        <button id="source" type="button">Choose game folder</button>
+      </div>
+      <div class="step">
+        <div><h2>Install location</h2><p id="destination-label">Choose your SD card or a staging folder.</p></div>
+        <button id="destination" type="button">Choose destination</button>
+      </div>
+      <div class="step">
+        <div><h2>Switch executables</h2><p id="release-label">Use the latest release packaged with this installer.</p></div>
+        <label class="button" for="release">Choose release ZIP</label>
+        <input id="release" class="visually-hidden" type="file" accept=".zip,application/zip">
+      </div>
+      <div class="action">
+        <p>Your game files stay on this device.</p>
+        <button id="install" class="primary" type="button" disabled>Install to folder</button>
+      </div>
+    </section>
+    <section id="result" class="result" aria-label="Installation progress" hidden>
+      <p id="status" role="status"></p>
+      <progress id="progress" max="1" value="0" aria-label="Installation progress"></progress>
+      <details id="issues" hidden><summary>Conversion report</summary><ul id="errors"></ul></details>
+    </section>
+    <footer>
+      <a href="https://github.com/HDErick/OpenBLOPS-NX/releases/latest">Latest GitHub release</a>
+      <span>Output goes to <code>switch/OpenBLOPS-NX/</code>.</span>
+    </footer>
+  </main>
+</body>
+</html>

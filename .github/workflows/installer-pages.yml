@@ -1,0 +1,58 @@
+name: Publish Switch installer
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published, released, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    if: github.event_name == 'release' && !github.event.release.draft && !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Deploy from main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run installer-pages.yml --repo "$GITHUB_REPOSITORY" --ref main
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: installer-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - name: Build the browser converter
+        run: |
+          git clone --depth 1 --branch 4.0.20 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
+          "$RUNNER_TEMP/emsdk/emsdk" install 4.0.20
+          "$RUNNER_TEMP/emsdk/emsdk" activate 4.0.20
+          source "$RUNNER_TEMP/emsdk/emsdk_env.sh"
+          python3 installer/build.py
+      - name: Package the latest Switch release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern 'OpenBLOPS-NX.zip' --dir _site/release
+          node installer/check-release.mjs _site/release/OpenBLOPS-NX.zip
+          cp installer/index.html installer/style.css installer/app.js installer/release.mjs installer/converter-worker.js _site/
+          cp -r installer/generated _site/generated
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4

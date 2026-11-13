@@ -1,0 +1,5011 @@
+// convert.cpp -- offline 32->64-bit fastfile converter (Stage 1: rawfile,
+// stringtable, localize). Reads a shipped .ff, transcodes each asset from its
+// x86 (4-byte-pointer) layout into a native-LP64 "prelinked zone" (KBZ1) that
+// the on-device generic relocator consumes.
+//
+// Each transcode fn mirrors the game's Load_<T> (src/database/db_load.cpp) but
+// writes LP64 fields + records relocations instead of fixing up in place.
+//
+// The hard part is de-duplicated pointers: a shipped string can be emitted once
+// and referenced again by a 32-bit "stream offset" that encodes (block, byte).
+// To resolve those we emulate the game's APPEND-ONLY block-4 memory cursor in
+// lockstep (every AllocLoad_* / Load_Stream that targets block 4), recording
+// x86-offset -> output-Loc for each datum. A second pass then rewrites each
+// deferred offset ref. Correctness is self-checking: the final emulated block-4
+// cursor must equal XFileHeader.blockSize[4] exactly.
+#include "prelink.h"
+#include "layout_gen.h"   // x86 -> LP64 field maps, from layout/layout.sh
+#include <zlib.h>
+#include <unordered_map>
+#include <map>
+
+// asset type ids (src/database/db_assetnames.cpp g_assetNames)
+enum { AT_LOCALIZE = 23, AT_RAWFILE = 36, AT_STRINGTABLE = 37 };
+
+static std::vector<uint8_t> readFile(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> b(n);
+    if (fread(b.data(), 1, n, f) != (size_t)n) { fprintf(stderr, "short read\n"); exit(1); }
+    fclose(f); return b;
+}
+static std::vector<uint8_t> inflateAll(const uint8_t *src, size_t srcLen) {
+    std::vector<uint8_t> out(1 << 20);
+    z_stream zs; memset(&zs, 0, sizeof(zs));
+    inflateInit(&zs);
+    zs.next_in = (Bytef *)src; zs.avail_in = (uInt)srcLen;
+    for (;;) {
+        if (zs.total_out >= out.size()) out.resize(out.size() * 2);
+        zs.next_out = out.data() + zs.total_out;
+        zs.avail_out = (uInt)(out.size() - zs.total_out);
+        int r = inflate(&zs, Z_NO_FLUSH);
+        if (r == Z_STREAM_END) break;
+        if (r != Z_OK) break;
+        if (zs.avail_in == 0 && zs.avail_out != 0) break;
+    }
+    out.resize(zs.total_out); inflateEnd(&zs); return out;
+}
+
+// ---- block-4 x86 memory emulation (for de-dup pointer resolution) -----------
+static const int OUT = 4;                // output block we place everything in
+static uint32_t g_x86b4 = 0;             // emulated game block-4 byte cursor
+static std::unordered_map<uint32_t, Prelink::Loc> g_b4map; // x86 off -> out Loc
+struct Deferred { Prelink::Loc obj; uint32_t field; uint32_t x86off; int asset; int line; };
+static std::vector<Deferred> g_deferred; // block-4 offset refs, resolved in pass 2
+static int g_cntAlias = 0, g_cntOffOther = 0;
+static int g_curAsset = -1;              // asset being transcoded, for diagnostics
+
+// DB_AllocStreamPos(param): align the cursor up. param 0->none, 1->2, 3->4.
+static inline uint32_t alignUp(uint32_t v, uint32_t param) { return (v + param) & ~param; }
+
+// Reserve `size` bytes in the emulated block-4 image at alignment `param`,
+// mapping that x86 offset to output location `out` (if valid). Returns x86 off.
+static bool g_traceB4 = false;           // FFB4=1: log every block-4 reservation
+struct B4Log { uint32_t off, size; int line; };
+static std::vector<B4Log> g_b4log;       // every reservation, in order
+static uint32_t b4Reserve(uint32_t param, uint32_t size, Prelink::Loc out,
+                          int line = __builtin_LINE()) {
+    g_x86b4 = alignUp(g_x86b4, param);
+    uint32_t off = g_x86b4;
+    if (out.valid()) g_b4map[off] = out;
+    g_b4log.push_back({off, size, line});
+    if (g_traceB4) fprintf(stderr, "    b4 asset=%d off=%u +%u (line %d)\n",
+                           g_curAsset, off, size, line);
+    g_x86b4 += size;
+    return off;
+}
+
+// Offset pointers (DB_ConvertOffsetToPointer) may name a place *inside* an
+// array: a portal's cell, an aabb tree's run of smodel indexes. g_b4map only
+// knows where each reservation starts, so reservations made through
+// b4ReserveRange also record how their x86 bytes map onto the output: a run
+// of records, x86 size xs each and LP64 size ls, or plain bytes (xs = ls = 1).
+// A reference into the middle of a record whose layout changed stays
+// unresolved rather than landing on the wrong field.
+struct B4Range { uint32_t size; Prelink::Loc out; uint32_t xs, ls; };
+static std::map<uint32_t, B4Range> g_b4ranges;   // x86 start -> range
+
+static uint32_t b4ReserveRange(uint32_t param, uint32_t size, Prelink::Loc out,
+                               uint32_t xs = 1, uint32_t ls = 1,
+                               int line = __builtin_LINE()) {
+    uint32_t off = b4Reserve(param, size, out, line);
+    if (out.valid() && size) g_b4ranges[off] = {size, out, xs, ls};
+    return off;
+}
+
+static bool resolveB4(uint32_t off, Prelink::Loc &out) {
+    auto it = g_b4map.find(off);
+    if (it != g_b4map.end()) { out = it->second; return true; }
+    auto r = g_b4ranges.upper_bound(off);
+    if (r == g_b4ranges.begin()) return false;
+    --r;
+    const B4Range &b = r->second;
+    uint32_t rel = off - r->first;
+    if (rel >= b.size) return false;
+    uint32_t i = rel / b.xs, w = rel % b.xs;
+    if (w && b.xs != b.ls) return false;
+    out = Prelink::Loc{b.out.blk, b.out.off + i * b.ls + w};
+    return true;
+}
+
+// ...but an asset's OWN struct never lands in block 4. Every Load_<T>Ptr
+// wraps its allocation in DB_PushStreamPos(0) / DB_PopStreamPos, and popping
+// out of block 0 rewinds that block's cursor (db_stream.cpp:69): block 0 is
+// scratch, reused by the next asset. Only what Load_<T> goes on to reference,
+// under its own DB_PushStreamPos(4), advances the block-4 cursor.
+// Load_GfxTextureLoad (db_load.cpp:1904) does the same for the whole
+// GfxImageLoadDef, pixel payload included -- the loader hands it to the GPU
+// and drops it. Counted separately so the accounting stays visible.
+static uint32_t g_x86temp = 0;
+static void tempReserve(uint32_t size) { g_x86temp += size; }
+
+// Emit an inline string to the output block and mirror its block-4 x86 alloc
+// (AllocLoad_raw_byte = DB_AllocStreamPos(0), then strlen+1 bytes).
+static Prelink::Loc emitInlineStr(Prelink &z, const std::string &s) {
+    Prelink::Loc L = z.putBytes(OUT, (const uint8_t *)s.c_str(), s.size() + 1, 1);
+    // A range, byte for byte: the linker shares string tails, so a later
+    // reference may point into the middle of this one (SP localize entries).
+    b4ReserveRange(0, (uint32_t)s.size() + 1, L);
+    return L;
+}
+
+// Write an XString slot from a tag already read from the stream:
+//   0          -> null
+//   -1         -> inline NUL-terminated string follows now
+//   -2 (alias) -> pointer-insert back-ref (unused in code_* zones)
+//   other      -> block/offset back-ref into already-emitted data (resolved p2)
+static std::string g_lastXString;   // the last inline string, for debug dumps
+static void putXStringFromTag(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field, uint32_t tag,
+                              int line = __builtin_LINE()) {
+    g_lastXString.clear();
+    if (tag == TAG_NULL) { z.putPtr(obj, field, Prelink::none()); return; }
+    if (tag == TAG_INLINE) { std::string s = r.cstr(); g_lastXString = s; z.putPtr(obj, field, emitInlineStr(z, s)); return; }
+    if (tag == TAG_ALIAS) { ++g_cntAlias; z.putPtr(obj, field, Prelink::none()); return; }
+    uint32_t blk = (tag - 1) >> 29, off = (tag - 1) & 0x1FFFFFFF;
+    if (blk == 4) g_deferred.push_back({obj, field, off, g_curAsset, line}); // zero until pass 2
+    else { ++g_cntOffOther; z.putPtr(obj, field, Prelink::none()); }
+}
+
+// Script strings are u16 indices into the zone's string list, which
+// Load_ScriptStringCustom swaps for SL ids at load time. The converter keeps
+// the indices and records every slot holding one; the device loader maps them
+// (NX_KbzRemapScriptStrings, nx_kbz.cpp). Arrays reached by an offset ref are
+// already marked where they were loaded.
+static std::vector<std::string> g_zoneStrings;   // index -> string ("" = null)
+static void markScrStr(Prelink &z, Prelink::Loc obj, uint32_t field,
+                       uint32_t count = 1, uint32_t stride = 2) {
+    if (!obj.valid()) return;
+    for (uint32_t i = 0; i < count; ++i)
+        z.scriptStrings.push_back({(uint8_t)obj.blk, obj.off + field + i * stride});
+}
+
+// FxEffectDefRef slots hold an effect's name; Load_FxEffectDefFromName swaps it
+// for the FxEffectDef at load time. The converter records every such slot and
+// the device loader resolves them after registering the zone (nx_kbz.cpp).
+static void markFxRef(Prelink &z, Prelink::Loc obj, uint32_t field) {
+    if (obj.valid()) z.fxRefs.push_back({(uint8_t)obj.blk, obj.off + field});
+}
+
+// ---- per-asset transcoders --------------------------------------------------
+// Load_RawFile: x86 {char* name; int len; char* buffer} (12) -> LP64 (24).
+static void tRawFile(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag = r.u32();
+    int32_t  len     = r.i32();
+    uint32_t bufTag  = r.u32();
+    z.putI32(obj, 8, len);                       // name@0, len@8, buffer@16
+    putXStringFromTag(r, z, obj, 0, nameTag);
+    if (bufTag == TAG_NULL) { z.putPtr(obj, 16, Prelink::none()); }
+    else {                                       // AllocLoad_raw_byte, len+1 bytes
+        uint32_t n = (uint32_t)len + 1;
+        Prelink::Loc buf = z.alloc(OUT, n, 1);
+        r.bytes(z.at(buf), n);
+        b4Reserve(0, n, buf);
+        z.putPtr(obj, 16, buf);
+    }
+}
+
+// Load_StringTable: x86 {char* name; int col; int row; Cell* values; short* cellIndex} (20).
+// Array loaders read ALL fixed structs as one block first, then per-element data.
+static void tStringTable(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag = r.u32();
+    int32_t  col     = r.i32();
+    int32_t  row     = r.i32();
+    uint32_t valsTag = r.u32();
+    uint32_t idxTag  = r.u32();
+    z.putI32(obj, 8, col);                       // name@0,col@8,row@12,values@16,cellIndex@24
+    z.putI32(obj, 12, row);
+    putXStringFromTag(r, z, obj, 0, nameTag);
+    int cells = row * col;
+    if (valsTag == TAG_NULL) z.putPtr(obj, 16, Prelink::none());
+    else {                                       // StringTableCell x86 (8) -> LP64 (16)
+        Prelink::Loc arr = z.alloc(OUT, (size_t)cells * 16, 8);
+        z.putPtr(obj, 16, arr);
+        b4Reserve(3, (uint32_t)cells * 8, arr);  // 8*cells struct block (align 4)
+        std::vector<uint32_t> strTag(cells);
+        for (int i = 0; i < cells; ++i) {
+            strTag[i]    = r.u32();
+            int32_t hash = r.i32();
+            z.putI32(Prelink::Loc{OUT, arr.off + (uint32_t)i * 16}, 8, hash);
+        }
+        for (int i = 0; i < cells; ++i)          // then inline cell strings, in order
+            putXStringFromTag(r, z, Prelink::Loc{OUT, arr.off + (uint32_t)i * 16}, 0, strTag[i]);
+    }
+    if (idxTag == TAG_NULL) z.putPtr(obj, 24, Prelink::none());
+    else {                                       // AllocLoad_XBlendInfo (align 2), 2*cells
+        Prelink::Loc arr = z.alloc(OUT, (size_t)cells * 2, 2);
+        z.putPtr(obj, 24, arr);
+        b4Reserve(1, (uint32_t)cells * 2, arr);
+        r.bytes(z.at(arr), (size_t)cells * 2);
+    }
+}
+
+// Load_LocalizeEntry: x86 {char* value; char* name} (8) -> LP64 (16).
+static void tLocalizeEntry(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t valueTag = r.u32();
+    uint32_t nameTag  = r.u32();
+    putXStringFromTag(r, z, obj, 0, valueTag);
+    putXStringFromTag(r, z, obj, 8, nameTag);
+}
+
+// ---- techset tree -----------------------------------------------------------
+// MaterialTechniqueSet -> MaterialTechnique[] -> MaterialPass[] -> leaves.
+// Sizes in the comments are x86 (the sizeof= annotations in r_material.h) and
+// the LP64 equivalents; every struct here widens because of embedded pointers.
+
+enum { AT_TECHSET = 7 };
+
+enum {
+    SZ_SHADER_ARG  = 16,    // x86 8
+    SZ_VERTEX_DECL = 184,   // x86 108
+    SZ_SHADER      = 32,    // x86 16, vertex and pixel share the layout
+    SZ_PASS        = 40,    // x86 20
+    SZ_TECH_HDR    = 16,    // x86 8, passArray follows
+    SZ_TECHSET     = 1056   // x86 528
+};
+
+static void putU16(Prelink &z, Prelink::Loc l, uint32_t field, uint16_t v) {
+    memcpy(z.at(l) + field, &v, 2);
+}
+
+// Resolve a non-string pointer slot from its stream tag. This is the
+// DB_ConvertOffsetToPointer form (db_stream_load.cpp:82): the offset names the
+// datum itself.
+static void putStructOffsetRef(Prelink &z, Prelink::Loc obj, uint32_t field, uint32_t tag,
+                               int line = __builtin_LINE()) {
+    uint32_t blk = (tag - 1) >> 29, off = (tag - 1) & 0x1FFFFFFF;
+    if (blk == 4) g_deferred.push_back({obj, field, off, g_curAsset, line});
+    else { ++g_cntOffOther; z.putPtr(obj, field, Prelink::none()); }
+}
+
+// ---- asset handles ----------------------------------------------------------
+// Asset pointers do NOT resolve like the above. Load_<T>Ptr's fallback is
+// DB_ConvertOffsetToAlias (db_stream_load.cpp:63), which *dereferences*:
+// the offset names a 4-byte slot in block 4 whose contents are the asset
+// pointer. Two things fill such slots:
+//   - XAsset[i].header, at assetArray + i*8 + 4, once asset i is loaded;
+//   - a slot DB_InsertPointer (db_stream.cpp:113) reserves when the asset was
+//     written with tag -2, which is why -2 costs 4 block-4 bytes that -1 does
+//     not.
+// A slot is filled before anything can reference it -- the stream is written
+// in load order -- so alias references resolve immediately, which also makes
+// a chain of aliases resolve for free.
+static std::unordered_map<uint32_t, Prelink::Loc> g_aliasMap;   // slot off -> asset
+static int g_cntAliasOther = 0, g_aliasOk = 0, g_aliasBad = 0;
+
+// DB_InsertPointer: reserve the 4-byte alias slot, in block 4, align 4.
+static uint32_t insertPointerSlot() {
+    return b4Reserve(3, 4, Prelink::none());
+}
+
+// Record that the 4-byte block-4 slot at x86 offset `slot` holds a pointer to
+// `target`. Any pointer field of a block-4 struct is a candidate source for a
+// later alias reference, so callers pass the slot's x86 offset where they know
+// it; 0 means "this pointer does not live in block 4" (an asset's own header,
+// for instance, which sits in the rewound temp block).
+static void noteAliasSlot(uint32_t slot, Prelink::Loc target) {
+    if (slot && target.valid()) g_aliasMap[slot] = target;
+}
+
+static Prelink::Loc putAssetHandleRef(Prelink &z, Prelink::Loc obj, uint32_t field,
+                                      uint32_t tag, int line = __builtin_LINE()) {
+    uint32_t blk = (tag - 1) >> 29, off = (tag - 1) & 0x1FFFFFFF;
+    if (blk != 4) {
+        ++g_cntAliasOther; z.putPtr(obj, field, Prelink::none());
+        return Prelink::none();
+    }
+    auto it = g_aliasMap.find(off);
+    if (it == g_aliasMap.end()) {
+        ++g_aliasBad;
+        if (getenv("FFDBG") && g_aliasBad <= 20) {
+            uint32_t st = 0, sz = 0; int ln = 0;
+            for (const auto &e : g_b4log)
+                if (e.off <= off && e.off >= st) { st = e.off; sz = e.size; ln = e.line; }
+            fprintf(stderr, "  UNRESOLVED alias slot=%u (asset %d, ref from line %d)"
+                    " inside [%u,+%u) at +%u  reserved at line %d\n",
+                    off, g_curAsset, line, st, sz, off - st, ln);
+        }
+        z.putPtr(obj, field, Prelink::none());
+        return Prelink::none();
+    }
+    ++g_aliasOk;
+    z.putPtr(obj, field, it->second);
+    return it->second;
+}
+
+// MaterialVertexDeclaration: 108 flat -> 184. The trailing decl[18] are D3D
+// objects built at runtime, so those bytes are consumed and dropped.
+static void tMaterialVertexDeclaration(Reader &r, Prelink &z, Prelink::Loc obj) {
+    r.bytes(z.at(obj), 4);          // streamCount, hasOptionalSource, isLoaded, pad
+    r.bytes(z.at(obj) + 8, 32);     // routing.data[16], two bytes each
+    r.skip(72);                     // routing.decl[18]
+}
+
+// FFCONV_SHADERDUMP=<dir>: write every inline shader's bytecode to
+// <dir>/<vs|ps>_<name>.bin and the material -> techset -> technique -> shader
+// map to <dir>/index.txt, to inspect what a material really runs.
+static const char *shaderDumpDir() {
+    static const char *dir = getenv("FFCONV_SHADERDUMP");
+    return dir;
+}
+static FILE *shaderDumpIndex() {
+    static FILE *f = shaderDumpDir() ? fopen((std::string(shaderDumpDir()) + "/index.txt").c_str(), "a") : nullptr;
+    return f;
+}
+static std::string g_passDesc;     // shaders of the pass being read
+static std::string g_techDesc;     // passes of the technique being read
+static std::map<uint64_t, std::string> g_techsetNames;   // techset loc -> name
+static std::map<uint32_t, std::string> g_shaderNamesX86; // shader x86 block-4 offset -> name
+static std::string g_lastShaderName;
+static void noteSharedShader(const char *kind, uint32_t tag) {
+    if (!shaderDumpDir()) return;
+    auto it = g_shaderNamesX86.find((tag - 1) & 0x1FFFFFFF);
+    g_passDesc += std::string(" ") + kind + "=" + (it != g_shaderNamesX86.end() ? it->second : "?");
+}
+
+// MaterialVertexShader / MaterialPixelShader: {char* name; prog} 16 -> 32.
+// prog.vs (or .ps) is a runtime D3D object; only the load def carries over.
+// Load order: the whole 16-byte block, then the name string, then the bytecode.
+static void tMaterialShader(Reader &r, Prelink &z, Prelink::Loc obj, const char *kind) {
+    uint32_t nameTag  = r.u32();
+    r.u32();                        // vs/ps -- runtime object, dropped
+    uint32_t progTag  = r.u32();
+    uint16_t progSize = r.u16();
+    r.u16();                        // padding
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+    const std::string name = g_lastXString;
+    g_lastShaderName = name;
+    putU16(z, obj, 24, progSize);   // prog.loadDef.programSize
+
+    if (progTag != TAG_NULL) {
+        uint32_t n = (uint32_t)progSize * 4;   // Load_DWORDArray counts DWORDs
+        Prelink::Loc buf = z.alloc(OUT, n, 4);
+        r.bytes(z.at(buf), n);
+        b4Reserve(3, n, buf);
+        z.putPtr(obj, 16, buf);     // prog.loadDef.program
+        if (shaderDumpDir() && !name.empty()) {
+            std::string path = std::string(shaderDumpDir()) + "/" + kind + "_" + name + ".bin";
+            if (FILE *f = fopen(path.c_str(), "wb")) { fwrite(z.at(buf), 1, n, f); fclose(f); }
+        }
+    }
+    g_passDesc += std::string(" ") + kind + "=" + (name.empty() ? "?" : name);
+}
+
+// The union tail of MaterialShaderArgument. Load_MaterialArgumentDef reads
+// nothing except for types 1 and 7, and then only when the slot held -1.
+static void finishShaderArgument(Reader &r, Prelink &z, Prelink::Loc e,
+                                 uint16_t type, uint32_t uTag) {
+    if ((type == 1 || type == 7) && uTag != TAG_NULL) {
+        if (uTag == TAG_INLINE) {
+            Prelink::Loc lit = z.alloc(OUT, 16, 4);   // float[4]
+            r.bytes(z.at(lit), 16);
+            b4Reserve(3, 16, lit);
+            z.putPtr(e, 8, lit);
+        } else {
+            putStructOffsetRef(z, e, 8, uTag);
+        }
+    } else {
+        // codeConst / codeSampler / nameHash: a plain 32-bit value, not a
+        // pointer. It lives in the low half of the widened union.
+        memcpy(z.at(e) + 8, &uTag, 4);
+    }
+}
+
+// MaterialPass: 20 -> 40. vertexDecl@0, vertexShader@8, pixelShader@16,
+// the four counters@24, args@32.
+static void tMaterialPass(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t declTag = r.u32();
+    uint32_t vsTag   = r.u32();
+    uint32_t psTag   = r.u32();
+    uint8_t  counts[4] = {0, 0, 0, 0};
+    r.bytes(counts, 4);
+    uint32_t argsTag = r.u32();
+
+    memcpy(z.at(obj) + 24, counts, 4);
+    g_passDesc.clear();
+
+    if (declTag == TAG_INLINE) {
+        Prelink::Loc d = z.alloc(OUT, SZ_VERTEX_DECL, 8);
+        b4Reserve(3, 108, d);
+        tMaterialVertexDeclaration(r, z, d);
+        z.putPtr(obj, 0, d);
+    } else if (declTag != TAG_NULL) {
+        putStructOffsetRef(z, obj, 0, declTag);
+    }
+
+    if (vsTag == TAG_INLINE) {
+        Prelink::Loc s = z.alloc(OUT, SZ_SHADER, 8);
+        const uint32_t x86 = b4Reserve(3, 16, s);
+        tMaterialShader(r, z, s, "vs");
+        g_shaderNamesX86[x86] = g_lastShaderName;
+        z.putPtr(obj, 8, s);
+    } else if (vsTag != TAG_NULL) {
+        putStructOffsetRef(z, obj, 8, vsTag);
+        noteSharedShader("vs", vsTag);
+    }
+
+    if (psTag == TAG_INLINE) {
+        Prelink::Loc s = z.alloc(OUT, SZ_SHADER, 8);
+        const uint32_t x86 = b4Reserve(3, 16, s);
+        tMaterialShader(r, z, s, "ps");
+        g_shaderNamesX86[x86] = g_lastShaderName;
+        z.putPtr(obj, 16, s);
+    } else if (psTag != TAG_NULL) {
+        putStructOffsetRef(z, obj, 16, psTag);
+        noteSharedShader("ps", psTag);
+    }
+
+    if (argsTag != TAG_NULL) {
+        const int n = counts[0] + counts[1] + counts[2];
+        Prelink::Loc a = z.alloc(OUT, (size_t)n * SZ_SHADER_ARG, 8);
+        b4Reserve(3, (uint32_t)n * 8, a);
+
+        // Array loaders read every fixed record first, then the per-element
+        // data -- Load_MaterialShaderArgumentArray (db_load.cpp:2226).
+        std::vector<uint16_t> types(n), dests(n);
+        std::vector<uint32_t> uTags(n);
+        for (int i = 0; i < n; ++i) {
+            types[i] = r.u16(); dests[i] = r.u16(); uTags[i] = r.u32();
+        }
+        for (int i = 0; i < n; ++i) {
+            Prelink::Loc e{a.blk, a.off + (uint32_t)i * SZ_SHADER_ARG};
+            putU16(z, e, 0, types[i]);
+            putU16(z, e, 2, dests[i]);
+            finishShaderArgument(r, z, e, types[i], uTags[i]);
+        }
+        z.putPtr(obj, 32, a);
+    }
+    g_techDesc += " [" + g_passDesc + " ]";
+}
+
+// MaterialTechnique: {char* name; u16 flags; u16 passCount; MaterialPass
+// passArray[]}. The engine asserts the passes sit immediately after the
+// 8-byte header in the stream, so header and passes are one block.
+// Note the order: the passes come BEFORE the name string.
+static Prelink::Loc tMaterialTechnique(Reader &r, Prelink &z) {
+    uint32_t nameTag   = r.u32();
+    uint16_t flags     = r.u16();
+    uint16_t passCount = r.u16();
+
+    Prelink::Loc t = z.alloc(OUT, SZ_TECH_HDR + (size_t)passCount * SZ_PASS, 8);
+    b4Reserve(3, 8 + (uint32_t)passCount * 20, t);
+    putU16(z, t, 8, flags);
+    putU16(z, t, 10, passCount);
+
+    // Load_MaterialPassArray reads all the fixed 20-byte records as one
+    // block, then walks them; tMaterialPass mirrors that per element.
+    g_techDesc.clear();
+    for (uint16_t i = 0; i < passCount; ++i) {
+        Prelink::Loc p{t.blk, t.off + SZ_TECH_HDR + (uint32_t)i * SZ_PASS};
+        tMaterialPass(r, z, p);
+    }
+
+    putXStringFromTag(r, z, t, 0, nameTag);
+    if (shaderDumpIndex())
+        fprintf(shaderDumpIndex(), "    technique %s:%s\n",
+                g_lastXString.empty() ? "?" : g_lastXString.c_str(), g_techDesc.c_str());
+    return t;
+}
+
+// MaterialTechniqueSet: 528 -> 1056. Fixed block is the name tag, four bytes
+// of flags, and 130 technique tags; then the name string, then each technique.
+static void tMaterialTechniqueSet(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag = r.u32();
+    uint8_t  hdr[4] = {0, 0, 0, 0};
+    r.bytes(hdr, 4);                // worldVertFormat, unused, techsetFlags
+    memcpy(z.at(obj) + 8, hdr, 4);
+
+    uint32_t techTags[130];
+    for (int i = 0; i < 130; ++i) techTags[i] = r.u32();
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+    if (shaderDumpIndex()) {
+        g_techsetNames[((uint64_t)obj.blk << 32) | obj.off] = g_lastXString;
+        fprintf(shaderDumpIndex(), "  techset %s\n", g_lastXString.empty() ? "?" : g_lastXString.c_str());
+    }
+
+    for (int i = 0; i < 130; ++i) {
+        const uint32_t field = 16 + (uint32_t)i * 8;
+        if (techTags[i] == TAG_INLINE) {
+            if (shaderDumpIndex()) fprintf(shaderDumpIndex(), "   [%d]", i);
+            Prelink::Loc t = tMaterialTechnique(r, z);
+            z.putPtr(obj, field, t);
+        } else if (techTags[i] != TAG_NULL) {
+            putStructOffsetRef(z, obj, field, techTags[i]);
+        }
+    }
+}
+
+// ---- images -----------------------------------------------------------------
+// GfxImage: 52 -> 72. The texture union at offset 0 doubles as the load-def
+// pointer while the asset is on disk; Load_GfxImage (db_load.cpp:1966) reads
+// the fixed block, then the name, then walks that pointer.
+
+enum { AT_IMAGE = 8, SZ_IMAGE = 72 };
+
+// GfxImageLoadDef: {u8 levelCount; u8 flags; pad2; int format; int
+// resourceSize; u8 data[]}. No pointers, so the header keeps its x86 shape --
+// only the trailing pixel blob varies in length.
+static Prelink::Loc tGfxImageLoadDef(Reader &r, Prelink &z, Prelink::Loc img) {
+    uint8_t  levelCount = 0, flags = 0;
+    r.bytes(&levelCount, 1);
+    r.bytes(&flags, 1);
+    r.u16();                                  // padding
+    int32_t format       = r.i32();
+    int32_t resourceSize = r.i32();
+
+    const uint32_t total = 12 + (uint32_t)(resourceSize > 0 ? resourceSize : 0);
+    Prelink::Loc def = z.alloc(OUT, total, 4);
+    tempReserve(total);            // Load_GfxTextureLoad -> block 0
+
+    uint8_t *d = z.at(def);
+    d[0] = levelCount;
+    d[1] = flags;
+    memcpy(d + 4, &format, 4);
+    memcpy(d + 8, &resourceSize, 4);
+    if (resourceSize > 0) r.bytes(d + 12, (size_t)resourceSize);
+
+    z.putPtr(img, 0, def);                    // GfxImage.texture.loadDef
+    return def;
+}
+
+static void tGfxImage(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t texTag = r.u32();                // texture union @0
+    uint8_t  mid[8];                          // mapType..track @4
+    r.bytes(mid, 8);
+    uint8_t  card[8] = {0};                   // cardMemory @12
+    r.bytes(card, 8);
+    uint8_t  dims[8] = {0};                   // width..streaming @20
+    r.bytes(dims, 8);
+    uint32_t baseSize   = r.u32();            // @28
+    r.u32();                                  // pixels -- runtime, dropped
+    uint32_t loadedSize = r.u32();            // @36
+    uint8_t  skipped    = 0;
+    r.bytes(&skipped, 1);
+    r.skip(3);                                // padding
+    uint32_t nameTag = r.u32();               // @44
+    uint32_t hash    = r.u32();               // @48
+
+    uint8_t *o = z.at(obj);
+    memcpy(o + 8,  mid,  4);                  // mapType, semantic, category, delayLoad
+    memcpy(o + 12, mid + 4, 4);               // picmip, noPicmip, track
+    memcpy(o + 16, card, 8);
+    memcpy(o + 24, dims, 8);
+    memcpy(o + 32, &baseSize, 4);
+    memcpy(o + 48, &loadedSize, 4);
+    o[52] = skipped;
+    memcpy(o + 64, &hash, 4);
+
+    putXStringFromTag(r, z, obj, 56, nameTag);
+
+    // Load_GfxTextureLoad: -1 and -2 both mean the load def follows inline.
+    if (texTag == TAG_INLINE || texTag == TAG_ALIAS) {
+        uint32_t slot = (texTag == TAG_ALIAS) ? insertPointerSlot() : 0;
+        Prelink::Loc def = tGfxImageLoadDef(r, z, obj);
+        if (texTag == TAG_ALIAS) g_aliasMap[slot] = def;
+    } else if (texTag != TAG_NULL) {
+        putAssetHandleRef(z, obj, 0, texTag);
+    }
+}
+
+// ---- materials --------------------------------------------------------------
+// Material: 192 -> 208. Load_Material (db_load.cpp:2454) reads the whole fixed
+// block, then walks info.name, the technique set, and three tables.
+
+enum { AT_MATERIAL = 6, SZ_MATERIAL = 208, SZ_MAT_INFO = 40, SZ_TEXDEF = 24 };
+
+static void tMaterial(Reader &r, Prelink &z, Prelink::Loc obj) {
+    // --- fixed block, 192 bytes ---
+    Prelink::Loc info{obj.blk, obj.off};        // MaterialInfo sits at offset 0
+    uint32_t infoNameTag = r.u32();
+    uint8_t  infoHead[8] = {0};
+    r.bytes(infoHead, 8);
+    r.skip(4);
+    uint8_t  infoTail[24];
+    r.bytes(infoTail, 24);
+
+    uint8_t stateBitsEntry[130];
+    r.bytes(stateBitsEntry, 130);
+
+    uint8_t counts[6];                          // texture, constant, stateBits,
+    r.bytes(counts, 6);                         // stateFlags, cameraRegion, mips
+
+    uint32_t techTag  = r.u32();
+    uint32_t texTag   = r.u32();
+    uint32_t constTag = r.u32();
+    uint32_t sbTag    = r.u32();
+
+    uint8_t *o = z.at(obj);
+    memcpy(o + 8,   infoHead, 8);
+    memcpy(o + 16,  infoTail, 24);
+    memcpy(o + 40,  stateBitsEntry, 130);
+    memcpy(o + 170, counts, 6);
+
+    // --- then the referenced data, in Load_Material's order ---
+    putXStringFromTag(r, z, info, 0, infoNameTag);
+    if (shaderDumpIndex())
+        fprintf(shaderDumpIndex(), "material %s\n", g_lastXString.empty() ? "?" : g_lastXString.c_str());
+
+    if (techTag == TAG_INLINE || techTag == TAG_ALIAS) {
+        Prelink::Loc t = z.alloc(OUT, SZ_TECHSET, 8);
+        tempReserve(528);      // Load_MaterialTechniqueSetPtr -> block 0
+        if (techTag == TAG_ALIAS) g_aliasMap[insertPointerSlot()] = t;
+        tMaterialTechniqueSet(r, z, t);
+        z.addAsset(AT_TECHSET, t);          // Load_MaterialTechniqueSetAsset, db_load.cpp:2442
+        z.putPtr(obj, 176, t);
+    } else if (techTag != TAG_NULL) {
+        Prelink::Loc t = putAssetHandleRef(z, obj, 176, techTag);
+        if (shaderDumpIndex()) {
+            auto it = g_techsetNames.find(((uint64_t)t.blk << 32) | t.off);
+            fprintf(shaderDumpIndex(), "  techset %s (shared)\n",
+                    it != g_techsetNames.end() ? it->second.c_str() : "?");
+        }
+    }
+
+    const int nTex   = counts[0];
+    const int nConst = counts[1];
+    const int nSb    = counts[2];
+
+    if (texTag == TAG_INLINE) {
+        Prelink::Loc tbl = z.alloc(OUT, (size_t)nTex * SZ_TEXDEF, 8);
+        const uint32_t tblX86 = b4Reserve(3, (uint32_t)nTex * 16, tbl);
+
+        // Array loader: every fixed 16-byte record first, then per-element data.
+        std::vector<uint32_t> hashes(nTex), uTags(nTex);
+        std::vector<uint8_t>  flags(nTex * 8);
+        for (int i = 0; i < nTex; ++i) {
+            hashes[i] = r.u32();
+            r.bytes(&flags[i * 8], 8);          // nameStart..pad[3]
+            uTags[i]  = r.u32();
+        }
+        for (int i = 0; i < nTex; ++i) {
+            Prelink::Loc e{tbl.blk, tbl.off + (uint32_t)i * SZ_TEXDEF};
+            uint8_t *d = z.at(e);
+            memcpy(d, &hashes[i], 4);
+            memcpy(d + 4, &flags[i * 8], 8);
+
+            const uint8_t semantic = flags[i * 8 + 3];
+            if (semantic == 11) {
+                fprintf(stderr, "material texture %d is water (semantic 11); "
+                                "water_t is not transcoded yet\n", i);
+                exit(5);
+            }
+            const uint32_t uSlot = tblX86 + (uint32_t)i * 16 + 12;  // .u
+            if (uTags[i] == TAG_INLINE || uTags[i] == TAG_ALIAS) {
+                Prelink::Loc im = z.alloc(OUT, SZ_IMAGE, 8);
+                tempReserve(52);   // Load_GfxImagePtr -> block 0
+                if (uTags[i] == TAG_ALIAS) g_aliasMap[insertPointerSlot()] = im;
+                noteAliasSlot(uSlot, im);
+                tGfxImage(r, z, im);
+                z.addAsset(AT_IMAGE, im);   // Load_GfxImageAsset, db_load.cpp:1997
+                z.putPtr(e, 16, im);
+            } else if (uTags[i] != TAG_NULL) {
+                noteAliasSlot(uSlot, putAssetHandleRef(z, e, 16, uTags[i]));
+            }
+        }
+        z.putPtr(obj, 184, tbl);
+    } else if (texTag != TAG_NULL) {
+        putStructOffsetRef(z, obj, 184, texTag);
+    }
+
+    if (constTag == TAG_INLINE) {
+        // AllocLoad_GfxPackedVertex0 -> DB_AllocStreamPos(15), align 16.
+        // MaterialConstantDef has no pointers, so it stays 32 bytes.
+        const uint32_t n = (uint32_t)nConst * 32;
+        Prelink::Loc tbl = z.alloc(OUT, n, 16);
+        b4Reserve(15, n, tbl);
+        r.bytes(z.at(tbl), n);
+        z.putPtr(obj, 192, tbl);
+    } else if (constTag != TAG_NULL) {
+        putStructOffsetRef(z, obj, 192, constTag);
+    }
+
+    if (sbTag == TAG_INLINE) {
+        const uint32_t n = (uint32_t)nSb * 8;    // GfxStateBits, no pointers
+        Prelink::Loc tbl = z.alloc(OUT, n, 4);
+        b4Reserve(3, n, tbl);
+        r.bytes(z.at(tbl), n);
+        z.putPtr(obj, 200, tbl);
+    } else if (sbTag != TAG_NULL) {
+        putStructOffsetRef(z, obj, 200, sbTag);
+    }
+}
+
+// ---- small default assets ---------------------------------------------------
+
+enum { AT_PHYSPRESET = 1, AT_LIGHTDEF = 18, AT_XGLOBALS = 39 };
+enum { SZ_PHYSPRESET = 96, SZ_XGLOBALS = 48, SZ_LIGHTDEF = 32 };
+enum { AT_PHYSCONSTRAINTS = 2, SZ_PHYSCONSTRAINT = 200, SZ_PHYSCONSTRAINTS = 3216 };
+
+// PhysPreset: 84 -> 96. Two strings, everything else scalar.
+static void tPhysPreset(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag = r.u32();
+    uint8_t  mid[24];                  // flags, mass, bounce, friction,
+    r.bytes(mid, 24);                  // bulletForceScale, explosiveForceScale
+    uint32_t sndTag  = r.u32();
+    uint8_t  tail[52];                 // piecesSpread..buoyancyBoxMax
+    r.bytes(tail, 52);
+
+    uint8_t *o = z.at(obj);
+    memcpy(o + 8,  mid, 24);
+    memcpy(o + 40, tail, 52);
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+    putXStringFromTag(r, z, obj, 32, sndTag);
+}
+
+// Load_MaterialHandle (db_load.cpp:2504): -1 and -2 both mean an inline
+// Material follows; any other non-zero value is an offset alias.
+static void tMaterialHandle(Reader &r, Prelink &z, Prelink::Loc obj,
+                            uint32_t field, uint32_t tag, uint32_t x86slot = 0) {
+    if (tag == TAG_INLINE || tag == TAG_ALIAS) {
+        Prelink::Loc m = z.alloc(OUT, SZ_MATERIAL, 8);
+        tempReserve(192);      // Load_MaterialHandle -> block 0
+        if (tag == TAG_ALIAS) g_aliasMap[insertPointerSlot()] = m;
+        noteAliasSlot(x86slot, m);
+        tMaterial(r, z, m);
+        z.addAsset(AT_MATERIAL, m);         // Load_MaterialAsset, db_load.cpp:2523
+        z.putPtr(obj, field, m);
+    } else if (tag != TAG_NULL) {
+        noteAliasSlot(x86slot, putAssetHandleRef(z, obj, field, tag));
+    } else {
+        z.putPtr(obj, field, Prelink::none());
+    }
+}
+
+// XGlobals: 40 -> 48. Name plus scalars, nothing else.
+static void tXGlobals(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag = r.u32();
+    uint8_t  rest[36];
+    r.bytes(rest, 36);
+    memcpy(z.at(obj) + 8, rest, 36);
+    putXStringFromTag(r, z, obj, 0, nameTag);
+}
+
+// GfxLightDef: 16 -> 32. name@0, attenuation@8 (a GfxLightImage, itself
+// 8 -> 16 because of the image pointer), lmapLookupStart@24.
+static void tGfxLightDef(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag  = r.u32();
+    uint32_t imageTag = r.u32();
+    uint8_t  sampler  = 0;
+    r.bytes(&sampler, 1);
+    r.skip(3);                          // padding
+    int32_t  lmapStart = r.i32();
+
+    uint8_t *o = z.at(obj);
+    o[16] = sampler;                    // attenuation.samplerState
+    memcpy(o + 24, &lmapStart, 4);
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+
+    if (imageTag == TAG_INLINE || imageTag == TAG_ALIAS) {
+        Prelink::Loc im = z.alloc(OUT, SZ_IMAGE, 8);
+        tempReserve(52);       // Load_GfxImagePtr -> block 0
+        if (imageTag == TAG_ALIAS) g_aliasMap[insertPointerSlot()] = im;
+        tGfxImage(r, z, im);
+        z.addAsset(AT_IMAGE, im);           // Load_GfxImageAsset, db_load.cpp:1997
+        z.putPtr(obj, 8, im);           // attenuation.image
+    } else if (imageTag != TAG_NULL) {
+        putAssetHandleRef(z, obj, 8, imageTag);
+    }
+}
+
+// ---- menu tracing (FFMTRACE=1) ----------------------------------------------
+// A menu tree desync only shows up as garbage several structs later, so the
+// cheapest check is the window name each menuDef and itemDef reads: while the
+// cursor is aligned every one of them is a legible identifier.
+static const uint8_t *g_zoneBase = nullptr;
+static bool g_mtrace = false;
+static int  g_menuIdx = -1, g_itemIdx = -1;
+
+static void mtrace(Reader &r, const char *what, int val, uint32_t nameTag) {
+    if (!g_mtrace) return;
+    char name[64] = "<noname>";
+    if (nameTag == TAG_INLINE) {                 // the name follows at r.p
+        size_t n = 0;
+        while (n < sizeof(name) - 1 && r.p + n < r.end && r.p[n]) {
+            name[n] = (char)r.p[n]; ++n;
+        }
+        name[n] = 0;
+    }
+    fprintf(stderr, "  T menu=%d item=%d off=%zu %s=%d %s\n",
+            g_menuIdx, g_itemIdx, (size_t)(r.p - g_zoneBase), what, val, name);
+}
+
+// MenuList: 12 -> 24. Name, count, and an array of menuDef_t pointers.
+// Every menu loaded inline is also an asset of its own: Load_menuDef_ptr
+// (db_load.cpp:5778) calls Load_MenuAsset right after Load_menuDef_t, so the
+// zone registers each menu (type 22) before the list that holds it (type 21).
+// Its name is window.name, the first pointer of menuDef_t, which is what
+// DB_XAssetGetNameHandler[ASSET_TYPE_MENU] (DB_DDLGetName) reads.
+enum { AT_MENUFILE = 21, AT_MENU = 22, SZ_MENULIST = 24 };
+
+static Prelink::Loc tMenuDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field);
+
+static void tMenuList(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag   = r.u32();
+    int32_t  menuCount = r.i32();
+    uint32_t menusTag  = r.u32();
+
+    memcpy(z.at(obj) + 8, &menuCount, 4);
+    putXStringFromTag(r, z, obj, 0, nameTag);
+
+    if (menusTag != TAG_NULL) {
+        Prelink::Loc tbl = z.alloc(OUT, (size_t)menuCount * 8, 8);
+        // menus[] lives in block 4, so every element Load_menuDef_ptr fills
+        // (db_load.cpp:5790/5803 both write through *varmenuDef_ptr) is itself
+        // an alias slot a later reference can dereference. ui_mp/menus.txt
+        // lists the same menu more than once and does exactly that.
+        uint32_t tblX86 = b4Reserve(3, (uint32_t)menuCount * 4, tbl);
+        std::vector<uint32_t> tags(menuCount);
+        for (int i = 0; i < menuCount; ++i) tags[i] = r.u32();
+        for (int i = 0; i < menuCount; ++i) {
+            g_menuIdx = i; g_itemIdx = -1;
+            // Load_menuDef_ptr tests for -1 and -2; every other non-zero value
+            // is an alias that consumes no stream.
+            Prelink::Loc e{tbl.blk, tbl.off + (uint32_t)i * 8};
+            const uint32_t slotX86 = tblX86 + (uint32_t)i * 4;
+            if (tags[i] == TAG_INLINE || tags[i] == TAG_ALIAS) {
+                uint32_t slot = (tags[i] == TAG_ALIAS) ? insertPointerSlot() : 0;
+                Prelink::Loc md = tMenuDef(r, z, tbl, (uint32_t)i * 8);
+                // Load_MenuAsset runs only on this branch, once the whole
+                // menuDef_t has been read. An alias to a menu registers
+                // nothing, so a menu listed twice is still one asset.
+                z.addAsset(AT_MENU, md);
+                if (tags[i] == TAG_ALIAS) g_aliasMap[slot] = md;
+                noteAliasSlot(slotX86, md);
+            } else if (tags[i] != TAG_NULL)
+                noteAliasSlot(slotX86, putAssetHandleRef(z, e, 0, tags[i]));
+            else
+                z.putPtr(e, 0, Prelink::none());
+        }
+        z.putPtr(obj, 16, tbl);
+    }
+}
+
+// PhysConstraint: 168 -> 200. Three pointers (target_bone1, target_bone2,
+// material) and the runtime constraintHandle push everything after them along. The uint16 targetname and
+// target_ent fields are script string indices; Load_ScriptString reads
+// nothing from the stream; markScrStr records them.
+// Reads one 168-byte fixed record and returns its three pointer tags; the
+// referenced strings come later, after the whole block (Load_PhysConstraints
+// reads all 2696 bytes, then the name, then each constraint's data).
+struct PhysConstraintTags { uint32_t bone1, bone2, mat; };
+
+static PhysConstraintTags tPhysConstraintFixed(Reader &r, Prelink &z,
+                                               Prelink::Loc obj) {
+    PhysConstraintTags t;
+    uint8_t  head[20];
+    r.bytes(head, 20);
+    t.bone1 = r.u32();
+    uint8_t  mid[12];
+    r.bytes(mid, 12);
+    t.bone2 = r.u32();
+    uint8_t  body[100];
+    r.bytes(body, 100);
+    t.mat = r.u32();
+    uint8_t  tail[24];
+    r.bytes(tail, 24);
+
+    uint8_t *o = z.at(obj);
+    memcpy(o,       head, 20);
+    memcpy(o + 32,  mid,  12);
+    memcpy(o + 56,  body, 100);
+    memcpy(o + 168, tail, 4);       // constraintHandle, 8 bytes on LP64 (runtime; 0 here)
+    memcpy(o + 176, tail + 4, 20);  // rope_index, centity_num[4]
+    return t;
+}
+
+static void tPhysConstraints(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag = r.u32();
+    uint32_t count   = r.u32();
+    memcpy(z.at(obj) + 8, &count, 4);
+
+    PhysConstraintTags tags[16];
+    for (int i = 0; i < 16; ++i) {
+        Prelink::Loc c{obj.blk, obj.off + 16 + (uint32_t)i * SZ_PHYSCONSTRAINT};
+        tags[i] = tPhysConstraintFixed(r, z, c);
+        markScrStr(z, c, L_PhysConstraint__targetname);
+        markScrStr(z, c, L_PhysConstraint__target_ent1);
+        markScrStr(z, c, L_PhysConstraint__target_ent2);
+    }
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+
+    for (int i = 0; i < 16; ++i) {
+        Prelink::Loc c{obj.blk, obj.off + 16 + (uint32_t)i * SZ_PHYSCONSTRAINT};
+        putXStringFromTag(r, z, c, 24, tags[i].bone1);
+        putXStringFromTag(r, z, c, 48, tags[i].bone2);
+
+        tMaterialHandle(r, z, c, 160, tags[i].mat);
+    }
+}
+
+// ---- xanim ------------------------------------------------------------------
+// XAnimParts: 104 -> 152. A long chain of optional arrays; the load order in
+// Load_XAnimParts (db_load.cpp:1007) is name, names, notify, deltaPart, then
+// the six data arrays, then indices.
+//
+// Allocation alignments differ per array, and getting them wrong desyncs the
+// block-4 cursor: AllocLoad_raw_byte is 1, AllocLoad_XBlendInfo is 2,
+// AllocLoad_FxElemVisStateSample is 4.
+
+enum { AT_XANIM = 4, SZ_XANIM = 152 };
+
+static Prelink::Loc tSimpleArray(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                         uint32_t tag, uint32_t count, uint32_t elemSize,
+                         uint32_t allocParam) {
+    if (tag == TAG_NULL) { z.putPtr(obj, field, Prelink::none()); return Prelink::none(); }
+    const uint32_t n = count * elemSize;
+    Prelink::Loc buf = z.alloc(OUT, n ? n : 1, elemSize);
+    if (n) r.bytes(z.at(buf), n);
+    b4Reserve(allocParam, n, buf);
+    z.putPtr(obj, field, buf);
+    return buf;
+}
+
+// Array loaders come in two flavours. tSimpleArray is for the ones that take
+// any non-zero pointer as "the data follows inline". The ones that test the
+// pointer against -1 first -- XModel's bone arrays, most of WeaponDef -- treat
+// every other non-zero value as an offset that consumes no stream, so they go
+// through here instead. Getting the two mixed up silently eats or leaves
+// behind a whole array.
+static Prelink::Loc tOffsetOrArray(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                           uint32_t tag, uint32_t count, uint32_t elemSize,
+                           uint32_t allocParam) {
+    if (tag == TAG_NULL)   { z.putPtr(obj, field, Prelink::none()); return Prelink::none(); }
+    if (tag != TAG_INLINE) { putStructOffsetRef(z, obj, field, tag); return Prelink::none(); }
+    return tSimpleArray(r, z, obj, field, tag, count, elemSize, allocParam);
+}
+
+// XAnimDeltaPart and friends. The `indices` field in XAnimPartTransFrames and
+// XAnimDeltaPartQuatDataFrames is a placeholder: the real index array is
+// written inline right after the header, so both are variable-length. Element
+// width is 2 bytes when the animation has 256 frames or more, 1 otherwise.
+
+// XAnimPartTrans: header 8 (LP64) + XAnimPartTransData.
+// When size != 0 the union holds XAnimPartTransFrames: mins[3]@0, size[3]@12,
+// frames@24, then the inline index array at 32.
+static void tXAnimPartTrans(Reader &r, Prelink &z, Prelink::Loc obj,
+                            uint32_t field, uint16_t numframes) {
+    uint16_t size = r.u16();
+    uint8_t  smallTrans = 0;
+    r.bytes(&smallTrans, 1);
+    r.skip(1);                              // padding
+
+    const uint32_t idxWidth = (numframes >= 256) ? 2u : 1u;
+    const uint32_t idxCount = size ? (uint32_t)size + 1u : 0u;
+    const uint32_t idxBytes = idxCount * idxWidth;
+
+    const uint32_t total = size ? (8 + 32 + idxBytes) : (8 + 12);
+    Prelink::Loc t = z.alloc(OUT, total, 8);
+    b4Reserve(3, size ? (4 + 28 + idxBytes) : (4 + 12), t);
+
+    uint8_t *o = z.at(t);
+    memcpy(o, &size, 2);
+    o[2] = smallTrans;
+
+    if (!size) {
+        r.bytes(o + 8, 12);                 // a single vec3 lives in the union
+        z.putPtr(obj, field, t);
+        return;
+    }
+
+    r.bytes(o + 8, 24);                     // mins[3], size[3]
+    uint32_t framesTag = r.u32();           // the frames pointer slot
+    if (idxBytes) r.bytes(o + 40, idxBytes);// inline index array
+
+    if (framesTag != TAG_NULL) {
+        const uint32_t elem  = smallTrans ? 3u : 6u;   // byte or ushort triple
+        const uint32_t align = smallTrans ? 0u : 3u;
+        const uint32_t n     = idxCount * elem;
+        Prelink::Loc f = z.alloc(OUT, n ? n : 1, smallTrans ? 1 : 2);
+        if (n) r.bytes(z.at(f), n);
+        b4Reserve(align, n, f);
+        z.putPtr(t, 32, f);                 // XAnimPartTransFrames.frames
+    }
+
+    z.putPtr(obj, field, t);
+}
+
+// XAnimDeltaPartQuat: header 8 (LP64) + XAnimDeltaPartQuatData.
+// When size != 0 the union holds frames@0 then the inline index array at 8.
+static void tXAnimDeltaPartQuat(Reader &r, Prelink &z, Prelink::Loc obj,
+                                uint32_t field, uint16_t numframes) {
+    uint16_t size = r.u16();
+    r.skip(2);                              // padding
+
+    const uint32_t idxWidth = (numframes >= 256) ? 2u : 1u;
+    const uint32_t idxCount = size ? (uint32_t)size + 1u : 0u;
+    const uint32_t idxBytes = idxCount * idxWidth;
+
+    const uint32_t total = size ? (8 + 8 + idxBytes) : (8 + 4);
+    Prelink::Loc q = z.alloc(OUT, total, 8);
+    b4Reserve(3, size ? (4 + 4 + idxBytes) : (4 + 4), q);
+
+    uint8_t *o = z.at(q);
+    memcpy(o, &size, 2);
+
+    if (!size) {
+        r.bytes(o + 8, 4);                  // a single XQuat2
+        z.putPtr(obj, field, q);
+        return;
+    }
+
+    uint32_t framesTag = r.u32();
+    if (idxBytes) r.bytes(o + 16, idxBytes);
+
+    if (framesTag != TAG_NULL) {
+        const uint32_t n = idxCount * 4;    // XQuat2 is int16[2]
+        Prelink::Loc f = z.alloc(OUT, n ? n : 1, 2);
+        if (n) r.bytes(z.at(f), n);
+        b4Reserve(3, n, f);
+        z.putPtr(q, 8, f);                  // XAnimDeltaPartQuatDataFrames.frames
+    }
+
+    z.putPtr(obj, field, q);
+}
+
+// XAnimDeltaPart: 8 -> 16, two pointers.
+static void tXAnimDeltaPart(Reader &r, Prelink &z, Prelink::Loc obj,
+                            uint32_t field, uint16_t numframes) {
+    uint32_t transTag = r.u32();
+    uint32_t quatTag  = r.u32();
+
+    Prelink::Loc d = z.alloc(OUT, 16, 8);
+    b4Reserve(3, 8, d);
+
+    if (transTag != TAG_NULL) tXAnimPartTrans(r, z, d, 0, numframes);
+    if (quatTag  != TAG_NULL) tXAnimDeltaPartQuat(r, z, d, 8, numframes);
+
+    z.putPtr(obj, field, d);
+}
+
+static void tXAnimParts(Reader &r, Prelink &z, Prelink::Loc obj) {
+    if (getenv("FFDBG")) {
+        fprintf(stderr, "  xanim raw header:\n");
+        for (int i = 0; i < 112; i += 16) {
+            fprintf(stderr, "    %3d:", i);
+            for (int j = 0; j < 16; ++j) fprintf(stderr, " %02x", r.p[i + j]);
+            fprintf(stderr, "  ");
+            for (int j = 0; j < 16; ++j) {
+                unsigned char c = r.p[i + j];
+                fputc((c >= 32 && c < 127) ? c : '.', stderr);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
+    uint32_t nameTag = r.u32();
+    uint8_t  counts[16] = {0};        // dataByteCount .. bStreamable (@4..19)
+    r.bytes(counts, 16);
+    uint32_t streamedFileSize = r.u32();
+    uint8_t  bones[13];               // boneCount[10], notifyCount, assetType, isDefault
+    r.bytes(bones, 13);
+    r.skip(3);                        // padding
+    uint8_t  mid[24];                 // randomDataShortCount .. loopEntryTime
+    r.bytes(mid, 24);
+
+    uint32_t namesTag   = r.u32();
+    uint32_t byteTag    = r.u32();
+    uint32_t shortTag   = r.u32();
+    uint32_t intTag     = r.u32();
+    uint32_t rShortTag  = r.u32();
+    uint32_t rByteTag   = r.u32();
+    uint32_t rIntTag    = r.u32();
+    uint32_t indicesTag = r.u32();
+    uint32_t notifyTag  = r.u32();
+    uint32_t deltaTag   = r.u32();
+
+    uint8_t *o = z.at(obj);
+    memcpy(o + 8,  counts, 16);
+    memcpy(o + 24, &streamedFileSize, 4);
+    memcpy(o + 28, bones, 13);
+    memcpy(o + 44, mid, 24);
+
+    // counts we need, read back from the copied bytes
+    uint16_t dataByteCount, dataShortCount, dataIntCount;
+    uint16_t rDataByteCount, rDataIntCount, numframes;
+    memcpy(&dataByteCount,  counts + 0, 2);
+    memcpy(&dataShortCount, counts + 2, 2);
+    memcpy(&dataIntCount,   counts + 4, 2);
+    memcpy(&rDataByteCount, counts + 6, 2);
+    memcpy(&rDataIntCount,  counts + 8, 2);
+    memcpy(&numframes,      counts + 10, 2);
+    uint32_t rDataShortCount, indexCount;
+    memcpy(&rDataShortCount, mid + 0, 4);
+    memcpy(&indexCount,      mid + 4, 4);
+
+    if (getenv("FFDBG")) {
+        fprintf(stderr,
+            "  xanim: numframes=%u bones9=%u notifyCount=%u\n"
+            "    counts: byte=%u short=%u int=%u rByte=%u rInt=%u rShort=%u idx=%u\n"
+            "    tags: names=%08x notify=%08x delta=%08x\n"
+            "          byte=%08x short=%08x int=%08x\n"
+            "          rShort=%08x rByte=%08x rInt=%08x indices=%08x\n",
+            numframes, bones[9], bones[10],
+            dataByteCount, dataShortCount, dataIntCount,
+            rDataByteCount, rDataIntCount, rDataShortCount, indexCount,
+            namesTag, notifyTag, deltaTag,
+            byteTag, shortTag, intTag,
+            rShortTag, rByteTag, rIntTag, indicesTag);
+    }
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+
+    // names: ScriptString array, boneCount[9] entries of 2 bytes
+    markScrStr(z, tSimpleArray(r, z, obj, 72, namesTag, bones[9], 2, 1), 0, bones[9]);
+
+    if (notifyTag != TAG_NULL) {
+        // XAnimNotifyInfo is 8 bytes: {ScriptString name; float time}. No
+        // pointers, so it keeps its size.
+        markScrStr(z, tSimpleArray(r, z, obj, 136, notifyTag, bones[10], 8, 3), 0, bones[10], 8);
+    }
+
+    if (deltaTag != TAG_NULL)
+        tXAnimDeltaPart(r, z, obj, 144, numframes);
+
+    tSimpleArray(r, z, obj, 80,  byteTag,   dataByteCount,   1, 0);
+    tSimpleArray(r, z, obj, 88,  shortTag,  dataShortCount,  2, 1);
+    tSimpleArray(r, z, obj, 96,  intTag,    dataIntCount,    4, 3);
+    tSimpleArray(r, z, obj, 104, rShortTag, rDataShortCount, 2, 1);
+    tSimpleArray(r, z, obj, 112, rByteTag,  rDataByteCount,  1, 0);
+    tSimpleArray(r, z, obj, 120, rIntTag,   rDataIntCount,   4, 3);
+
+    // indices: bytes when numframes < 256, shorts otherwise
+    if (numframes >= 256)
+        tSimpleArray(r, z, obj, 128, indicesTag, indexCount, 2, 1);
+    else
+        tSimpleArray(r, z, obj, 128, indicesTag, indexCount, 1, 0);
+}
+
+// XSurfaceCollisionTree: 40 -> 56. Bottom of the xmodel tree -- neither
+// XSurfaceCollisionNode (16) nor XSurfaceCollisionLeaf (2) holds a pointer.
+enum { SZ_COLLTREE = 56 };
+
+static void tXSurfaceCollisionTree(Reader &r, Prelink &z, Prelink::Loc obj,
+                                   uint32_t field) {
+    Prelink::Loc t = z.alloc(OUT, SZ_COLLTREE, 8);
+    b4Reserve(3, 40, t);
+
+    uint8_t  bounds[24];               // trans[3], scale[3]
+    r.bytes(bounds, 24);
+    uint32_t nodeCount = r.u32();
+    uint32_t nodesTag  = r.u32();
+    uint32_t leafCount = r.u32();
+    uint32_t leafsTag  = r.u32();
+
+    uint8_t *o = z.at(t);
+    memcpy(o,      bounds, 24);
+    memcpy(o + 24, &nodeCount, 4);
+    memcpy(o + 40, &leafCount, 4);
+
+    if (nodesTag != TAG_NULL) {
+        const uint32_t n = nodeCount * 16;   // AllocLoad_GfxPackedVertex0 -> 16
+        Prelink::Loc b = z.alloc(OUT, n ? n : 1, 16);
+        if (n) r.bytes(z.at(b), n);
+        b4Reserve(15, n, b);
+        z.putPtr(t, 32, b);
+    }
+
+    if (leafsTag != TAG_NULL) {
+        const uint32_t n = leafCount * 2;    // AllocLoad_XBlendInfo -> 2
+        Prelink::Loc b = z.alloc(OUT, n ? n : 1, 2);
+        if (n) r.bytes(z.at(b), n);
+        b4Reserve(1, n, b);
+        z.putPtr(t, 48, b);
+    }
+
+    z.putPtr(obj, field, t);
+}
+
+// XSurface: 68 -> 104. Load_XSurface (db_load.cpp:1843) reads the fixed block,
+// then vertInfo, then verts0, then vertList, then triIndices. vb0 and
+// indexBuffer are runtime D3D objects and stay null.
+
+enum { SZ_XSURFACE = 104, SZ_VERTINFO = 24, SZ_RIGIDVERT = 16 };
+
+// Load_XSurfaceArray reads every 68-byte surface header as one run before it
+// walks them, so the two phases have to stay apart: a model with more than one
+// surface desyncs the moment they are interleaved.
+struct SurfTags {
+    uint32_t triIdx, blend, tension, verts0, vertList;
+    int16_t  vc[4];
+    uint16_t vertListCount, vertCount, triCount;
+};
+
+static SurfTags tXSurfaceFixed(Reader &r, Prelink &z, Prelink::Loc obj) {
+    SurfTags t;
+    uint8_t  head[12];                 // tileMode .. baseVertIndex
+    r.bytes(head, 12);
+    t.triIdx = r.u32();
+
+    r.bytes(t.vc, 8);                  // vertInfo.vertCount[4]
+    t.blend   = r.u32();
+    t.tension = r.u32();
+
+    t.verts0 = r.u32();
+    r.u32();                           // vb0 -- runtime object
+    t.vertList = r.u32();
+    r.u32();                           // indexBuffer -- runtime object
+    uint8_t  partBits[20];
+    r.bytes(partBits, 20);
+
+    uint8_t *o = z.at(obj);
+    memcpy(o,       head, 12);
+    memcpy(o + 24,  t.vc, 8);          // vertInfo.vertCount
+    memcpy(o + 80,  partBits, 20);
+
+    t.vertListCount = head[1];
+    memcpy(&t.vertCount, head + 4, 2);
+    memcpy(&t.triCount,  head + 6, 2);
+    return t;
+}
+
+static void tXSurfaceRefs(Reader &r, Prelink &z, Prelink::Loc obj, const SurfTags &t) {
+    const uint32_t blendTag = t.blend, tensionTag = t.tension;
+    const uint32_t verts0Tag = t.verts0, vertListTag = t.vertList, triIdxTag = t.triIdx;
+    const int16_t *vcInfo = t.vc;
+    const uint16_t vertListCount = t.vertListCount, vertCount = t.vertCount,
+                   triCount = t.triCount;
+
+    // vertInfo lives inline at offset 24; its two pointers are at 32 and 40.
+    Prelink::Loc vi{obj.blk, obj.off + 24};
+
+    {
+        const uint32_t n = 7u * (uint32_t)vcInfo[3] + 5u * (uint32_t)vcInfo[2]
+                         + 3u * (uint32_t)vcInfo[1] + (uint32_t)vcInfo[0];
+        tOffsetOrArray(r, z, vi, 8, blendTag, n, 2, 1);
+    }
+
+    {
+        // Load_floatArray(1, 12 * sum(vertCount)), AllocLoad_FxElemVisStateSample.
+        const uint32_t n = 12u * ((uint32_t)vcInfo[0] + (uint32_t)vcInfo[1]
+                                + (uint32_t)vcInfo[2] + (uint32_t)vcInfo[3]);
+        tOffsetOrArray(r, z, vi, 16, tensionTag, n, 4, 3);
+    }
+
+    if (verts0Tag == TAG_INLINE) {
+        // AllocLoad_GfxPackedVertex0 -> align 16. GfxPackedVertex has no
+        // pointers, so it keeps its 32 bytes.
+        const uint32_t n = (uint32_t)vertCount * 32;
+        Prelink::Loc b = z.alloc(OUT, n ? n : 1, 16);
+        if (n) r.bytes(z.at(b), n);
+        b4Reserve(15, n, b);
+        z.putPtr(obj, 48, b);
+    } else if (verts0Tag != TAG_NULL) {
+        putStructOffsetRef(z, obj, 48, verts0Tag);
+    }
+
+    if (vertListTag == TAG_INLINE) {
+        Prelink::Loc tbl = z.alloc(OUT, (size_t)vertListCount * SZ_RIGIDVERT, 8);
+        b4Reserve(3, (uint32_t)vertListCount * 12, tbl);
+        std::vector<uint32_t> treeTags(vertListCount);
+        for (uint32_t i = 0; i < vertListCount; ++i) {
+            Prelink::Loc e{tbl.blk, tbl.off + i * SZ_RIGIDVERT};
+            uint8_t counts[8] = {0};
+            r.bytes(counts, 8);
+            memcpy(z.at(e), counts, 8);
+            treeTags[i] = r.u32();
+        }
+        for (uint32_t i = 0; i < vertListCount; ++i) {
+            Prelink::Loc e{tbl.blk, tbl.off + i * SZ_RIGIDVERT};
+            if (treeTags[i] == TAG_INLINE) {
+                tXSurfaceCollisionTree(r, z, e, 8);
+            } else if (treeTags[i] != TAG_NULL) {
+                putStructOffsetRef(z, e, 8, treeTags[i]);
+            }
+        }
+        z.putPtr(obj, 64, tbl);
+    } else if (vertListTag != TAG_NULL) {
+        putStructOffsetRef(z, obj, 64, vertListTag);
+    }
+
+    if (triIdxTag == TAG_INLINE) {
+        const uint32_t n = 3u * (uint32_t)triCount * 2u;
+        Prelink::Loc b = z.alloc(OUT, n ? n : 1, 16);
+        if (n) r.bytes(z.at(b), n);
+        b4Reserve(15, n, b);
+        z.putPtr(obj, 16, b);
+    } else if (triIdxTag != TAG_NULL) {
+        putStructOffsetRef(z, obj, 16, triIdxTag);
+    }
+}
+
+// ---- xmodel -----------------------------------------------------------------
+// XModel: 252 -> 328. Load_XModel (db_load.cpp:3171) is linear: the fixed
+// block, then the name, then a run of arrays sized from counters already in
+// the header. XModelLodInfo, XBoneInfo, DObjAnimMat and XModelHighMipBounds
+// hold no pointers and keep their sizes.
+
+// ---- collision geometry -----------------------------------------------------
+// XModel::collmaps -> Collmap -> PhysGeomList -> PhysGeomInfo[] -> BrushWrapper
+// -> cbrushside_t[] / vec3[] / cplane_s[]. Mirrors Load_CollmapArray
+// (db_load.cpp:3156) down through Load_cbrushside_t (db_load.cpp:2984).
+//
+// The pointer tests are not uniform, and the difference decides whether a tag
+// consumes stream. Three loaders test only against zero, so ANY non-zero tag
+// means the data follows inline: Load_Collmap's geomList (:3148),
+// Load_PhysGeomList's geoms (:3137) and Load_BrushWrapper's sides (:3067).
+// The other four test against -1 first and treat every other value as a block-4
+// offset: PhysGeomInfo::brush (:3106), BrushWrapper::verts (:3075) and
+// ::planes (:3088), and cbrushside_t::plane (:2989).
+//
+// Allocation alignment is not uniform either. Most come from
+// AllocLoad_FxElemVisStateSample (align 4), but PhysGeomList::geoms and the
+// BrushWrapper itself come from AllocLoad_GfxPackedVertex0 -- align 16.
+//
+// Sizes: Collmap 4 -> 8, PhysGeomList 12 -> 24, PhysGeomInfo 68 -> 72,
+// BrushWrapper 96 -> 112, cbrushside_t 12 -> 16. cplane_s is pointer-free and
+// stays 20. All measured with offsetof under devkitA64.
+enum { SZ_COLLMAP = 8, SZ_PHYSGEOMLIST = 24, SZ_PHYSGEOMINFO = 72,
+       SZ_BRUSHWRAPPER = 112, SZ_CBRUSHSIDE = 16, SZ_CPLANE = 20 };
+
+// Load_BrushWrapper (db_load.cpp:3064): the whole 96-byte block, then sides,
+// verts and planes in that order. planes is numsides long, not numverts -- the
+// loader says so at :3092 and it is not a typo.
+static void tBrushWrapper(Reader &r, Prelink &z, Prelink::Loc bw) {
+    uint8_t  head[32];                     // mins[3], contents, maxs[3], numsides
+    r.bytes(head, 32);
+    uint32_t sidesTag  = r.u32();
+    uint8_t  axial[48];                    // axial_cflags[2][3], axial_sflags[2][3]
+    r.bytes(axial, 48);
+    uint32_t numverts  = r.u32();
+    uint32_t vertsTag  = r.u32();
+    uint32_t planesTag = r.u32();
+
+    uint32_t numsides;
+    memcpy(&numsides, head + 28, 4);
+
+    uint8_t *o = z.at(bw);
+    memcpy(o, head, 32);                   // mins .. numsides keep their offsets
+    memcpy(o + 40, axial, 48);
+    memcpy(o + 88, &numverts, 4);
+
+    if (sidesTag != TAG_NULL) {
+        Prelink::Loc sides = z.alloc(OUT, numsides ? (size_t)numsides * SZ_CBRUSHSIDE : 1, 8);
+        b4Reserve(3, numsides * 12, sides);
+        // Load_cbrushside_tArray reads the whole 12*count run, then walks it.
+        std::vector<uint32_t> planeTags(numsides);
+        for (uint32_t i = 0; i < numsides; ++i) {
+            uint8_t *sd = z.at(sides) + i * SZ_CBRUSHSIDE;
+            planeTags[i] = r.u32();
+            r.bytes(sd + 8, 8);            // cflags, sflags
+        }
+        for (uint32_t i = 0; i < numsides; ++i) {
+            Prelink::Loc sd{sides.blk, sides.off + i * SZ_CBRUSHSIDE};
+            if (planeTags[i] == TAG_NULL)        z.putPtr(sd, 0, Prelink::none());
+            else if (planeTags[i] != TAG_INLINE) putStructOffsetRef(z, sd, 0, planeTags[i]);
+            else {
+                Prelink::Loc pl = z.alloc(OUT, SZ_CPLANE, 4);
+                r.bytes(z.at(pl), 20);
+                b4Reserve(3, 20, pl);
+                z.putPtr(sd, 0, pl);
+            }
+        }
+        z.putPtr(bw, 32, sides);
+    } else {
+        z.putPtr(bw, 32, Prelink::none());
+    }
+
+    tOffsetOrArray(r, z, bw, 96,  vertsTag,  numverts, 12, 3);
+    tOffsetOrArray(r, z, bw, 104, planesTag, numsides, 20, 3);
+}
+
+// Load_PhysGeomInfoArray (db_load.cpp:3119): the whole 68*count run, then the
+// brush of each element.
+static void tPhysGeomInfoArray(Reader &r, Prelink &z, Prelink::Loc obj,
+                               uint32_t field, uint32_t count) {
+    Prelink::Loc tbl = z.alloc(OUT, count ? (size_t)count * SZ_PHYSGEOMINFO : 1, 8);
+    b4Reserve(15, count * 68, tbl);        // AllocLoad_GfxPackedVertex0
+    std::vector<uint32_t> brushTags(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint8_t *g = z.at(tbl) + i * SZ_PHYSGEOMINFO;
+        brushTags[i] = r.u32();
+        r.bytes(g + 8, 4);                 // type
+        r.bytes(g + 12, 60);               // orientation[3][3], offset[3], halfLengths[3]
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        Prelink::Loc g{tbl.blk, tbl.off + i * SZ_PHYSGEOMINFO};
+        if (brushTags[i] == TAG_NULL)        z.putPtr(g, 0, Prelink::none());
+        else if (brushTags[i] != TAG_INLINE) putStructOffsetRef(z, g, 0, brushTags[i]);
+        else {
+            Prelink::Loc bw = z.alloc(OUT, SZ_BRUSHWRAPPER, 8);
+            b4Reserve(15, 96, bw);         // AllocLoad_GfxPackedVertex0
+            tBrushWrapper(r, z, bw);
+            z.putPtr(g, 0, bw);
+        }
+    }
+    z.putPtr(obj, field, tbl);
+}
+
+// Load_PhysGeomList (db_load.cpp:3134).
+static void tPhysGeomList(Reader &r, Prelink &z, Prelink::Loc gl) {
+    uint32_t count    = r.u32();
+    uint32_t geomsTag = r.u32();
+    int32_t  contents = r.i32();
+
+    uint8_t *o = z.at(gl);
+    memcpy(o, &count, 4);
+    memcpy(o + 16, &contents, 4);
+
+    if (geomsTag != TAG_NULL) tPhysGeomInfoArray(r, z, gl, 8, count);
+    else                      z.putPtr(gl, 8, Prelink::none());
+}
+
+// Load_CollmapArray (db_load.cpp:3156): the whole 4*count pointer run, then
+// each Collmap's geomList.
+static void tCollmapArray(Reader &r, Prelink &z, Prelink::Loc obj,
+                          uint32_t field, uint32_t count) {
+    Prelink::Loc tbl = z.alloc(OUT, count ? (size_t)count * SZ_COLLMAP : 1, 8);
+    b4Reserve(3, count * 4, tbl);          // AllocLoad_FxElemVisStateSample
+    std::vector<uint32_t> tags(count);
+    for (uint32_t i = 0; i < count; ++i) tags[i] = r.u32();
+    for (uint32_t i = 0; i < count; ++i) {
+        Prelink::Loc c{tbl.blk, tbl.off + i * SZ_COLLMAP};
+        if (tags[i] == TAG_NULL) { z.putPtr(c, 0, Prelink::none()); continue; }
+        Prelink::Loc gl = z.alloc(OUT, SZ_PHYSGEOMLIST, 8);
+        b4Reserve(3, 12, gl);              // AllocLoad_FxElemVisStateSample
+        tPhysGeomList(r, z, gl);
+        z.putPtr(c, 0, gl);
+    }
+    z.putPtr(obj, field, tbl);
+}
+
+enum { AT_XMODEL = 5, SZ_XMODEL = 328, SZ_COLLSURF = 48 };
+enum { SZ_COLLTRI = 48 };   // confirm against XModelCollTri_s
+
+static void tXModel(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag = r.u32();
+    uint8_t  cnt[4];                       // numBones, numRootBones, numsurfs, lodRampType
+    r.bytes(cnt, 4);
+
+    uint32_t boneNamesTag = r.u32();
+    uint32_t parentTag    = r.u32();
+    uint32_t quatsTag     = r.u32();
+    uint32_t transTag     = r.u32();
+    uint32_t partClassTag = r.u32();
+    uint32_t baseMatTag   = r.u32();
+    uint32_t surfsTag     = r.u32();
+    uint32_t matHandlesTag= r.u32();
+
+    uint8_t lodInfo[128];
+    r.bytes(lodInfo, 128);
+    uint8_t lodAuto = 0;
+    r.bytes(&lodAuto, 1);
+    r.skip(3);
+
+    uint32_t collSurfsTag = r.u32();
+    int32_t  numCollSurfs = r.i32();
+    int32_t  contents     = r.i32();
+    uint32_t boneInfoTag  = r.u32();
+
+    uint8_t bounds[28];                    // radius, mins[3], maxs[3]
+    r.bytes(bounds, 28);
+    uint8_t lods[4] = {0};                 // numLods, collLod
+    r.bytes(lods, 4);
+
+    uint32_t streamTag    = r.u32();       // streamInfo.highMipBounds
+    int32_t  memUsage     = r.i32();
+    int32_t  flags        = r.i32();
+    uint8_t  bad = 0;
+    r.bytes(&bad, 1);
+    r.skip(3);
+    uint32_t physPresetTag = r.u32();
+    uint8_t  numCollmaps = 0;
+    r.bytes(&numCollmaps, 1);
+    r.skip(3);
+    uint32_t collmapsTag  = r.u32();
+    uint32_t physConstrTag= r.u32();
+
+    uint8_t *o = z.at(obj);
+    memcpy(o + 8,   cnt, 4);
+    memcpy(o + 80,  lodInfo, 128);
+    o[208] = lodAuto;
+    memcpy(o + 224, &numCollSurfs, 4);
+    memcpy(o + 228, &contents, 4);
+    memcpy(o + 240, bounds, 28);
+    memcpy(o + 268, lods, 4);
+    memcpy(o + 280, &memUsage, 4);
+    memcpy(o + 284, &flags, 4);
+    o[288] = bad;
+    o[304] = numCollmaps;
+
+    const uint32_t nBones = cnt[0];
+    const uint32_t nRoot  = cnt[1];
+    const uint32_t nSurfs = cnt[2];
+    const uint32_t nDiff  = nBones - nRoot;
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+
+    markScrStr(z, tOffsetOrArray(r, z, obj, 16, boneNamesTag, nBones, 2, 1), 0, nBones);
+
+    tOffsetOrArray(r, z, obj, 24, parentTag, nDiff, 1, 0);
+
+    tOffsetOrArray(r, z, obj, 32, quatsTag, nDiff * 4, 2, 1);
+
+    tOffsetOrArray(r, z, obj, 40, transTag, nDiff * 4, 4, 3);
+
+    tOffsetOrArray(r, z, obj, 48, partClassTag, nBones, 1, 0);
+
+    tOffsetOrArray(r, z, obj, 56, baseMatTag, nBones, 32, 3);
+
+    if (surfsTag != TAG_NULL) {
+        Prelink::Loc tbl = z.alloc(OUT, (size_t)nSurfs * SZ_XSURFACE, 8);
+        b4Reserve(3, nSurfs * 68, tbl);
+        std::vector<SurfTags> st(nSurfs);
+        for (uint32_t i = 0; i < nSurfs; ++i)
+            st[i] = tXSurfaceFixed(r, z, Prelink::Loc{tbl.blk, tbl.off + i * SZ_XSURFACE});
+        for (uint32_t i = 0; i < nSurfs; ++i)
+            tXSurfaceRefs(r, z, Prelink::Loc{tbl.blk, tbl.off + i * SZ_XSURFACE}, st[i]);
+        z.putPtr(obj, 64, tbl);
+    }
+
+    if (matHandlesTag != TAG_NULL) {
+        Prelink::Loc tbl = z.alloc(OUT, (size_t)nSurfs * 8, 8);
+        const uint32_t tblX86 = b4Reserve(3, nSurfs * 4, tbl);
+        // Load_MaterialHandleArray reads the whole 4*count pointer run first.
+        std::vector<uint32_t> tags(nSurfs);
+        for (uint32_t i = 0; i < nSurfs; ++i) tags[i] = r.u32();
+        for (uint32_t i = 0; i < nSurfs; ++i)
+            tMaterialHandle(r, z, Prelink::Loc{tbl.blk, tbl.off + i * 8}, 0, tags[i],
+                            tblX86 + i * 4);
+        z.putPtr(obj, 72, tbl);
+    }
+
+    if (collSurfsTag != TAG_NULL) {
+        Prelink::Loc tbl = z.alloc(OUT, (size_t)numCollSurfs * SZ_COLLSURF, 8);
+        b4Reserve(3, (uint32_t)numCollSurfs * 44, tbl);
+        std::vector<uint32_t> triTags(numCollSurfs);
+        std::vector<int32_t>  triCounts(numCollSurfs);
+        for (int i = 0; i < numCollSurfs; ++i) {
+            Prelink::Loc c{tbl.blk, tbl.off + (uint32_t)i * SZ_COLLSURF};
+            triTags[i]   = r.u32();
+            triCounts[i] = r.i32();
+            uint8_t rest[36];               // mins, maxs, boneIdx, contents, surfFlags
+            r.bytes(rest, 36);
+            memcpy(z.at(c) + 8, &triCounts[i], 4);
+            memcpy(z.at(c) + 12, rest, 36);
+        }
+        for (int i = 0; i < numCollSurfs; ++i) {
+            Prelink::Loc c{tbl.blk, tbl.off + (uint32_t)i * SZ_COLLSURF};
+            tSimpleArray(r, z, c, 0, triTags[i], (uint32_t)triCounts[i], SZ_COLLTRI, 3);
+        }
+        z.putPtr(obj, 216, tbl);
+    }
+
+    if (boneInfoTag != TAG_NULL)
+        tSimpleArray(r, z, obj, 232, boneInfoTag, nBones, 44, 3);
+
+    if (streamTag != TAG_NULL)
+        tSimpleArray(r, z, obj, 272, streamTag, nSurfs, 16, 3);
+
+    if (physPresetTag == TAG_INLINE || physPresetTag == TAG_ALIAS) {
+        Prelink::Loc p = z.alloc(OUT, SZ_PHYSPRESET, 8);
+        tempReserve(84);       // Load_PhysPresetPtr -> block 0
+        if (physPresetTag == TAG_ALIAS) g_aliasMap[insertPointerSlot()] = p;
+        tPhysPreset(r, z, p);
+        z.addAsset(AT_PHYSPRESET, p);       // Load_PhysPresetAsset, db_load.cpp:2837
+        z.putPtr(obj, 296, p);
+    } else if (physPresetTag != TAG_NULL) {
+        putAssetHandleRef(z, obj, 296, physPresetTag);
+    }
+
+    if (collmapsTag != TAG_NULL) tCollmapArray(r, z, obj, 312, numCollmaps);
+    else                         z.putPtr(obj, 312, Prelink::none());
+
+    if (physConstrTag == TAG_INLINE || physConstrTag == TAG_ALIAS) {
+        Prelink::Loc p = z.alloc(OUT, SZ_PHYSCONSTRAINTS, 8);
+        tempReserve(2696);     // Load_PhysConstraintsPtr -> block 0
+        if (physConstrTag == TAG_ALIAS) g_aliasMap[insertPointerSlot()] = p;
+        tPhysConstraints(r, z, p);
+        z.addAsset(AT_PHYSCONSTRAINTS, p);  // Load_PhysConstraintsAsset, db_load.cpp:2920
+        z.putPtr(obj, 320, p);
+    } else if (physConstrTag != TAG_NULL) {
+        putAssetHandleRef(z, obj, 320, physConstrTag);
+    }
+}
+
+// Reads the rpn array of an ExpressionStatement whose 16-byte header has
+// already been consumed, and hooks it into `dest` at `field`.
+enum { SZ_EXPRSTMT = 24, SZ_EXPRRPN = 24 };
+enum { VAL_STRING = 2 };   // expDataType: VAL_INT=0, VAL_FLOAT=1, VAL_STRING=2
+
+static void tExprRpnArray(Reader &r, Prelink &z, Prelink::Loc dest,
+                          uint32_t field, uint32_t tag, int32_t numRpn) {
+    if (tag == TAG_NULL) return;
+    if (tag != TAG_INLINE) { putStructOffsetRef(z, dest, field, tag); return; }
+
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)numRpn * SZ_EXPRRPN, 8);
+    b4Reserve(3, (uint32_t)numRpn * 12, tbl);
+
+    std::vector<int32_t>  types(numRpn), aVals(numRpn);
+    std::vector<uint32_t> bVals(numRpn);
+    for (int i = 0; i < numRpn; ++i) {
+        types[i] = r.i32(); aVals[i] = r.i32(); bVals[i] = r.u32();
+    }
+    for (int i = 0; i < numRpn; ++i) {
+        Prelink::Loc c{tbl.blk, tbl.off + (uint32_t)i * SZ_EXPRRPN};
+        uint8_t *d = z.at(c);
+        memcpy(d, &types[i], 4);
+        memcpy(d + 8, &aVals[i], 4);
+        if (types[i] == 0 && aVals[i] == VAL_STRING)
+            putXStringFromTag(r, z, c, 16, bVals[i]);
+        else
+            memcpy(d + 16, &bVals[i], 4);
+    }
+    z.putPtr(dest, field, tbl);
+}
+
+// ---- expressions ------------------------------------------------------------
+// ExpressionStatement: 16 -> 24. expressionRpn 12 -> 24, because the union at
+// its tail holds an Operand whose internals can be a pointer.
+// Only VAL_STRING operands consume stream (Load_operandInternalDataUnion).
+
+
+
+static void tExpressionStatement(Reader &r, Prelink &z, Prelink::Loc obj,
+                                 uint32_t field) {
+    uint32_t fileTag = r.u32();
+    int32_t  line    = r.i32();
+    int32_t  numRpn  = r.i32();
+    uint32_t rpnTag  = r.u32();
+
+    Prelink::Loc e{obj.blk, obj.off + field};
+    uint8_t *o = z.at(e);
+    memcpy(o + 8,  &line, 4);
+    memcpy(o + 12, &numRpn, 4);
+
+    putXStringFromTag(r, z, e, 0, fileTag);
+
+    if (rpnTag == TAG_NULL) return;
+    if (rpnTag != TAG_INLINE) { putStructOffsetRef(z, e, 16, rpnTag); return; }
+
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)numRpn * SZ_EXPRRPN, 8);
+    b4Reserve(3, (uint32_t)numRpn * 12, tbl);
+
+    // The array loader reads every 12-byte record first, then walks them.
+    std::vector<int32_t>  types(numRpn), aVals(numRpn);
+    std::vector<uint32_t> bVals(numRpn);
+    for (int i = 0; i < numRpn; ++i) {
+        types[i] = r.i32();
+        aVals[i] = r.i32();
+        bVals[i] = r.u32();
+    }
+    for (int i = 0; i < numRpn; ++i) {
+        Prelink::Loc c{tbl.blk, tbl.off + (uint32_t)i * SZ_EXPRRPN};
+        uint8_t *d = z.at(c);
+        memcpy(d, &types[i], 4);
+        memcpy(d + 8, &aVals[i], 4);          // dataType, or cmdIdx
+
+        if (types[i] == 0 && aVals[i] == VAL_STRING)
+            putXStringFromTag(r, z, c, 16, bVals[i]);
+        else
+            memcpy(d + 16, &bVals[i], 4);     // int, float or command index
+    }
+    z.putPtr(e, 16, tbl);
+}
+
+// ---- menu building blocks ---------------------------------------------------
+
+enum { SZ_WINDOWDEF = 176, SZ_EVENTSCRIPT = 64, SZ_EVENTHANDLER = 24 };
+
+// windowDef_t: 164 -> 176. Two rectDef_s of 24 bytes each hold no pointers;
+// only name, group and background need resolving.
+// windowDef_t in two phases: the caller reads its whole fixed block first,
+// then resolves references. Load_Window(0) never re-reads the 164 bytes.
+struct WindowTags { uint32_t name, group, background; };
+
+static WindowTags tWindowDefFixed(Reader &r, Prelink &z, Prelink::Loc w) {
+    WindowTags t;
+    t.name = r.u32();
+    uint8_t rects[48];
+    r.bytes(rects, 48);
+    t.group = r.u32();
+    uint8_t body[104];
+    r.bytes(body, 104);
+    t.background = r.u32();
+
+    uint8_t *o = z.at(w);
+    memcpy(o + 8,  rects, 48);
+    memcpy(o + 64, body, 104);
+    return t;
+}
+
+// `winX86` is the window's own x86 offset in block 4, or 0 when the enclosing
+// struct lives in the temp block (a menuDef does).
+static void tWindowDefRefs(Reader &r, Prelink &z, Prelink::Loc w, WindowTags t,
+                           uint32_t winX86 = 0) {
+    putXStringFromTag(r, z, w, 0,  t.name);
+    putXStringFromTag(r, z, w, 56, t.group);
+
+    tMaterialHandle(r, z, w, 168, t.background, winX86 ? winX86 + 160 : 0);
+}
+
+// ScriptCondition: 16 -> 24, a linked list of {fireOnTrue, constructID,
+// blockID, next}. Load_ScriptConditionNext re-reads the 16-byte block for each
+// link, so the recursion mirrors the loader.
+enum { SZ_SCRIPTCONDITION = 24 };
+
+static void tScriptCondition(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc c = z.alloc(OUT, SZ_SCRIPTCONDITION, 8);
+    b4Reserve(3, 16, c);
+
+    uint8_t  head[12];                     // fireOnTrue + pad, constructID, blockID
+    r.bytes(head, 12);
+    uint32_t nextTag = r.u32();
+
+    memcpy(z.at(c), head, 12);
+    z.putPtr(obj, field, c);
+
+    if (nextTag != TAG_NULL) tScriptCondition(r, z, c, 16);
+    else                     z.putPtr(c, 16, Prelink::none());
+}
+
+// GenericEventScript: 44 -> 64. A linked list; each node carries a condition
+// expression and an optional ScriptCondition chain.
+static void tGenericEventScript(Reader &r, Prelink &z, Prelink::Loc obj,
+                                uint32_t field) {
+    Prelink::Loc s = z.alloc(OUT, SZ_EVENTSCRIPT, 8);
+    b4Reserve(3, 44, s);
+
+    uint32_t prereqTag = r.u32();
+    // condition is inline at offset 8
+    uint32_t condFileTag = r.u32();
+    int32_t  condLine    = r.i32();
+    int32_t  condNumRpn  = r.i32();
+    uint32_t condRpnTag  = r.u32();
+    int32_t  type        = r.i32();
+    uint8_t  fireOnTrue  = 0;
+    r.bytes(&fireOnTrue, 1);
+    r.skip(3);
+    uint32_t actionTag   = r.u32();
+    int32_t  blockID     = r.i32();
+    int32_t  constructID = r.i32();
+    uint32_t nextTag     = r.u32();
+
+    uint8_t *o = z.at(s);
+    memcpy(o + 16, &condLine, 4);          // condition.line
+    memcpy(o + 20, &condNumRpn, 4);        // condition.numRpn
+    memcpy(o + 32, &type, 4);
+    o[36] = fireOnTrue;
+    memcpy(o + 48, &blockID, 4);
+    memcpy(o + 52, &constructID, 4);
+
+    z.putPtr(obj, field, s);
+
+    if (prereqTag != TAG_NULL) tScriptCondition(r, z, s, 0);
+    else                       z.putPtr(s, 0, Prelink::none());
+
+    // The condition's own referenced data follows, in Load_ExpressionStatement
+    // order: filename, then the rpn array.
+    putXStringFromTag(r, z, s, 8, condFileTag);
+    if (condRpnTag == TAG_INLINE) {
+        Prelink::Loc tbl = z.alloc(OUT, (size_t)condNumRpn * SZ_EXPRRPN, 8);
+        b4Reserve(3, (uint32_t)condNumRpn * 12, tbl);
+        std::vector<int32_t>  types(condNumRpn), aVals(condNumRpn);
+        std::vector<uint32_t> bVals(condNumRpn);
+        for (int i = 0; i < condNumRpn; ++i) {
+            types[i] = r.i32(); aVals[i] = r.i32(); bVals[i] = r.u32();
+        }
+        for (int i = 0; i < condNumRpn; ++i) {
+            Prelink::Loc c{tbl.blk, tbl.off + (uint32_t)i * SZ_EXPRRPN};
+            uint8_t *d = z.at(c);
+            memcpy(d, &types[i], 4);
+            memcpy(d + 8, &aVals[i], 4);
+            if (types[i] == 0 && aVals[i] == VAL_STRING)
+                putXStringFromTag(r, z, c, 16, bVals[i]);
+            else
+                memcpy(d + 16, &bVals[i], 4);
+        }
+        z.putPtr(s, 24, tbl);              // condition.rpn
+    } else if (condRpnTag != TAG_NULL) {
+        putStructOffsetRef(z, s, 24, condRpnTag);
+    }
+
+    putXStringFromTag(r, z, s, 40, actionTag);
+
+    if (nextTag != TAG_NULL)
+        tGenericEventScript(r, z, s, 56);
+}
+
+// GenericEventHandler and ItemKeyHandler share the shape {a, script, next},
+// 12 -> 24.
+static void tEventHandler(Reader &r, Prelink &z, Prelink::Loc obj,
+                          uint32_t field, bool firstIsString) {
+    Prelink::Loc h = z.alloc(OUT, SZ_EVENTHANDLER, 8);
+    b4Reserve(3, 12, h);
+
+    uint32_t aTag      = r.u32();          // name (handler) or key (key handler)
+    uint32_t scriptTag = r.u32();
+    uint32_t nextTag   = r.u32();
+
+    z.putPtr(obj, field, h);
+
+    if (firstIsString) putXStringFromTag(r, z, h, 0, aTag);
+    else               memcpy(z.at(h), &aTag, 4);
+
+    if (scriptTag != TAG_NULL) tGenericEventScript(r, z, h, 8);
+    if (nextTag   != TAG_NULL) tEventHandler(r, z, h, 16, firstIsString);
+}
+
+// ---- menu leaf definitions --------------------------------------------------
+// textExp_s (cmd.h:7), imageDef_s and ownerDrawDef_s are all a lone
+// ExpressionStatement, 16 -> 24. Their loaders (Load_textExp_t at
+// db_load.cpp:5574, Load_imageDef_t, Load_ownerDrawDef_t) allocate with
+// AllocLoad_FxElemVisStateSample (align 4), read the 16-byte block, then call
+// Load_ExpressionStatement(0) -- which does not re-read that header, so the
+// whole thing is one tExpressionStatement at offset 0.
+// None of these ptr loaders tests for -1, unlike ExpressionStatement::rpn:
+// any non-zero value means "follows inline", so there is no offset case.
+enum { SZ_EXPRWRAPPER = SZ_EXPRSTMT };
+
+static void tExprWrapper(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc e = z.alloc(OUT, SZ_EXPRWRAPPER, 8);
+    b4Reserve(3, 16, e);
+    z.putPtr(obj, field, e);
+    tExpressionStatement(r, z, e, 0);
+}
+
+// editFieldDef_s: 36 flat ints and floats, no pointers, so LP64 keeps 36.
+enum { SZ_EDITFIELDDEF = 36 };
+
+static void tEditFieldDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc e = z.alloc(OUT, SZ_EDITFIELDDEF, 4);
+    b4Reserve(3, 36, e);
+    r.bytes(z.at(e), 36);
+    z.putPtr(obj, field, e);
+}
+
+// enumDvarDef_s: a single string, 4 -> 8.
+enum { SZ_ENUMDVARDEF = 8 };
+
+static void tEnumDvarDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc e = z.alloc(OUT, SZ_ENUMDVARDEF, 8);
+    b4Reserve(3, 4, e);
+    uint32_t nameTag = r.u32();
+    z.putPtr(obj, field, e);
+    putXStringFromTag(r, z, e, 0, nameTag);
+}
+
+// gameMsgDef_s: two ints, 8 -> 8, nothing to resolve.
+enum { SZ_GAMEMSGDEF = 8 };
+
+static void tGameMsgDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc g = z.alloc(OUT, SZ_GAMEMSGDEF, 4);
+    b4Reserve(3, 8, g);
+    r.bytes(z.at(g), 8);
+    z.putPtr(obj, field, g);
+}
+
+// multiDef_s: 396 -> 656. dvarList[32] and dvarStr[32] are string arrays,
+// dvarValue[32] plain floats. Load_multiDef_t reaches dvarList through a cast
+// of the struct base -- it is simply the field at offset 0.
+enum { SZ_MULTIDEF = 656 };
+
+static void tMultiDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc md = z.alloc(OUT, SZ_MULTIDEF, 8);
+    b4Reserve(3, 396, md);
+
+    uint32_t listTags[32], strTags[32];
+    for (int i = 0; i < 32; ++i) listTags[i] = r.u32();
+    for (int i = 0; i < 32; ++i) strTags[i]  = r.u32();
+    uint8_t values[128];
+    r.bytes(values, 128);
+    int32_t count      = r.i32();
+    int32_t enterPress = r.i32();
+    int32_t strDef     = r.i32();
+
+    uint8_t *o = z.at(md);
+    memcpy(o + 512, values, 128);
+    memcpy(o + 640, &count, 4);
+    memcpy(o + 644, &enterPress, 4);
+    memcpy(o + 648, &strDef, 4);
+
+    z.putPtr(obj, field, md);
+
+    for (int i = 0; i < 32; ++i)
+        putXStringFromTag(r, z, md, (uint32_t)i * 8, listTags[i]);
+    for (int i = 0; i < 32; ++i)
+        putXStringFromTag(r, z, md, 256 + (uint32_t)i * 8, strTags[i]);
+}
+
+// MenuCell: 12 -> 16. stringValue is a raw maxChars-byte buffer, not an
+// XString, so it is read with AllocLoad_raw_byte + Load_charArray.
+// MenuRow: 24 -> 40. eventName and onFocusEventName are fixed 32-byte buffers.
+enum { SZ_MENUCELL = 16, SZ_MENUROW = 40, SZ_LISTBOXDEF = 688 };
+
+static void tMenuCellArray(Reader &r, Prelink &z, Prelink::Loc row,
+                           uint32_t field, int32_t numColumns) {
+    if (numColumns <= 0) { z.putPtr(row, field, Prelink::none()); return; }
+
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)numColumns * SZ_MENUCELL, 8);
+    b4Reserve(3, (uint32_t)numColumns * 12, tbl);
+
+    std::vector<int32_t>  types(numColumns), maxChars(numColumns);
+    std::vector<uint32_t> valTags(numColumns);
+    for (int i = 0; i < numColumns; ++i) {
+        types[i] = r.i32(); maxChars[i] = r.i32(); valTags[i] = r.u32();
+    }
+    for (int i = 0; i < numColumns; ++i) {
+        Prelink::Loc c{tbl.blk, tbl.off + (uint32_t)i * SZ_MENUCELL};
+        uint8_t *d = z.at(c);
+        memcpy(d, &types[i], 4);
+        memcpy(d + 4, &maxChars[i], 4);
+        if (valTags[i] == TAG_NULL || maxChars[i] <= 0) {
+            z.putPtr(c, 8, Prelink::none());
+        } else {
+            Prelink::Loc buf = z.alloc(OUT, (size_t)maxChars[i], 1);
+            r.bytes(z.at(buf), (size_t)maxChars[i]);
+            b4Reserve(0, (uint32_t)maxChars[i], buf);
+            z.putPtr(c, 8, buf);
+        }
+    }
+    z.putPtr(row, field, tbl);
+}
+
+static void tMenuRowArray(Reader &r, Prelink &z, Prelink::Loc lb, uint32_t field,
+                          int32_t maxRows, int32_t numColumns) {
+    if (maxRows <= 0) { z.putPtr(lb, field, Prelink::none()); return; }
+
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)maxRows * SZ_MENUROW, 8);
+    b4Reserve(3, (uint32_t)maxRows * 24, tbl);
+
+    struct RowTags { uint32_t cells, eventName, onFocusEventName; };
+    std::vector<RowTags> rt(maxRows);
+    for (int i = 0; i < maxRows; ++i) {
+        rt[i].cells            = r.u32();
+        rt[i].eventName        = r.u32();
+        rt[i].onFocusEventName = r.u32();
+        uint8_t tail[12];                  // disableArg + pad, status, name
+        r.bytes(tail, 12);
+        memcpy(z.at(Prelink::Loc{tbl.blk, tbl.off + (uint32_t)i * SZ_MENUROW}) + 24,
+               tail, 12);
+    }
+    for (int i = 0; i < maxRows; ++i) {
+        Prelink::Loc row{tbl.blk, tbl.off + (uint32_t)i * SZ_MENUROW};
+        if (rt[i].cells != TAG_NULL) tMenuCellArray(r, z, row, 0, numColumns);
+        else                         z.putPtr(row, 0, Prelink::none());
+
+        for (int k = 0; k < 2; ++k) {      // eventName@8, onFocusEventName@16
+            uint32_t tag = k ? rt[i].onFocusEventName : rt[i].eventName;
+            uint32_t off = k ? 16u : 8u;
+            if (tag == TAG_NULL) { z.putPtr(row, off, Prelink::none()); continue; }
+            Prelink::Loc buf = z.alloc(OUT, 32, 1);
+            r.bytes(z.at(buf), 32);
+            b4Reserve(0, 32, buf);
+            z.putPtr(row, off, buf);
+        }
+    }
+    z.putPtr(lb, field, tbl);
+}
+
+// listBoxDef_s: 668 -> 688. Everything up to selectIcon is plain data, so the
+// first 640 bytes copy across unchanged; only the three material handles and
+// the row table widen. rows is sized by maxRows, cells by numColumns.
+static void tListBoxDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc lb = z.alloc(OUT, SZ_LISTBOXDEF, 8);
+    b4Reserve(3, 668, lb);
+
+    uint8_t  head[640];                    // mousePos .. elementBackgroundColor
+    r.bytes(head, 640);
+    uint32_t selIconTag = r.u32();
+    uint32_t bgItemTag  = r.u32();
+    uint32_t hlTexTag   = r.u32();
+    int32_t  noBlink    = r.i32();
+    uint32_t rowsTag    = r.u32();
+    int32_t  maxRows    = r.i32();
+    int32_t  rowCount   = r.i32();
+
+    uint8_t *o = z.at(lb);
+    memcpy(o, head, 640);
+    memcpy(o + 664, &noBlink, 4);
+    memcpy(o + 680, &maxRows, 4);
+    memcpy(o + 684, &rowCount, 4);
+
+    int32_t numColumns;
+    memcpy(&numColumns, head + 28, 4);
+
+    z.putPtr(obj, field, lb);
+
+    tMaterialHandle(r, z, lb, 640, selIconTag);
+    tMaterialHandle(r, z, lb, 648, bgItemTag);
+    tMaterialHandle(r, z, lb, 656, hlTexTag);
+
+    if (rowsTag != TAG_NULL) tMenuRowArray(r, z, lb, 672, maxRows, numColumns);
+    else                     z.putPtr(lb, 672, Prelink::none());
+}
+
+// focusDefData_t and textDefData_t are unions discriminated by the type of the
+// enclosing itemDef, not by anything in the struct that holds them, so that
+// type has to be threaded down from tItemDef.
+// A non-zero tag for a type the switch does not cover loads nothing at all in
+// the game; the slot is left null here rather than pointing at nothing.
+static void tFocusDefData(Reader &r, Prelink &z, Prelink::Loc f, uint32_t field,
+                          int32_t itemType, uint32_t tag) {
+    if (tag == TAG_NULL) { z.putPtr(f, field, Prelink::none()); return; }
+    switch (itemType) {
+    case 4:
+        tListBoxDef(r, z, f, field); break;
+    case 0xA:
+        tMultiDef(r, z, f, field); break;
+    case 5: case 0xD: case 7: case 0xE: case 0x1E:
+    case 9: case 0xC: case 0x10: case 8: case 0x16:
+        tEditFieldDef(r, z, f, field); break;
+    case 0xB:
+        tEnumDvarDef(r, z, f, field); break;
+    default:
+        z.putPtr(f, field, Prelink::none()); break;
+    }
+}
+
+// focusItemDef_s: 24 -> 48. Four strings, an ItemKeyHandler chain and the
+// type-discriminated focusTypeData union.
+enum { SZ_FOCUSITEMDEF = 48 };
+
+static void tFocusItemDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                          int32_t itemType) {
+    Prelink::Loc f = z.alloc(OUT, SZ_FOCUSITEMDEF, 8);
+    b4Reserve(3, 24, f);
+
+    uint32_t enterTextTag = r.u32();
+    uint32_t exitTextTag  = r.u32();
+    uint32_t enterTag     = r.u32();
+    uint32_t exitTag      = r.u32();
+    uint32_t onKeyTag     = r.u32();
+    uint32_t focusDataTag = r.u32();
+
+    z.putPtr(obj, field, f);
+
+    putXStringFromTag(r, z, f, 0,  enterTextTag);
+    putXStringFromTag(r, z, f, 8,  exitTextTag);
+    putXStringFromTag(r, z, f, 16, enterTag);
+    putXStringFromTag(r, z, f, 24, exitTag);
+
+    if (onKeyTag != TAG_NULL) tEventHandler(r, z, f, 32, false);  // ItemKeyHandler
+    else                      z.putPtr(f, 32, Prelink::none());
+
+    tFocusDefData(r, z, f, 40, itemType, focusDataTag);
+}
+
+// textDef_s: 68 -> 80. The item type in code_post_gfx_mp's default menu is 3,
+// which Load_itemDefData_t routes here.
+enum { SZ_TEXTDEF = 80 };
+
+static void tTextDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                     int32_t itemType) {
+    Prelink::Loc t = z.alloc(OUT, SZ_TEXTDEF, 8);
+    b4Reserve(3, 68, t);
+
+    uint8_t  head[56];                 // textRect + the eight ints
+    r.bytes(head, 56);
+    uint32_t textTag    = r.u32();
+    uint32_t expDataTag = r.u32();
+    uint32_t typeDataTag= r.u32();
+
+    memcpy(z.at(t), head, 56);
+    z.putPtr(obj, field, t);
+
+    putXStringFromTag(r, z, t, 56, textTag);
+
+    if (expDataTag != TAG_NULL) tExprWrapper(r, z, t, 64);   // textExp_s
+    else                        z.putPtr(t, 64, Prelink::none());
+
+    // textTypeData -- Load_textDefData_t (db_load.cpp:5545)
+    if (typeDataTag == TAG_NULL) {
+        z.putPtr(t, 72, Prelink::none());
+    } else switch (itemType) {
+    case 3: case 4: case 0x15: case 0x14: case 0xA: case 5: case 0xD:
+    case 7: case 0xE: case 0x1E: case 9: case 0xC: case 0x10: case 8:
+    case 0xB: case 0x16:
+        tFocusItemDef(r, z, t, 72, itemType); break;
+    case 0xF:
+        tGameMsgDef(r, z, t, 72); break;
+    default:
+        z.putPtr(t, 72, Prelink::none()); break;
+    }
+}
+
+// animParamsDef_t: 108 -> 120. Load_animParamsDef_t (db_load.cpp:5344) reads
+// the fixed block, the name string, then an optional GenericEventHandler.
+// UIAnimInfo: 236 -> 272. Load_UIAnimInfo (db_load.cpp:5660) reads the whole
+// block -- the two inline animParamsDef_t scratch states included, whose own
+// name/onEvent pointers it never resolves -- then the animStates array.
+enum { SZ_ANIMPARAMS = 120, SZ_UIANIMINFO = 272 };
+
+// Copy the pointer-free body of an x86 animParamsDef_t into its LP64 record.
+static void animParamsBody(uint8_t *d, const uint8_t *src) {
+    memcpy(d + 8,   src + 4,  24);     // rectClient
+    memcpy(d + 32,  src + 28, 4);      // borderSize
+    memcpy(d + 36,  src + 32, 64);     // fore/back/border/outlineColor
+    memcpy(d + 100, src + 96, 8);      // textScale, rotation
+}
+
+static void tAnimParamsDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc a = z.alloc(OUT, SZ_ANIMPARAMS, 8);
+    b4Reserve(3, 108, a);
+
+    uint8_t blk[108];
+    r.bytes(blk, 108);
+    uint32_t nameTag, onEventTag;
+    memcpy(&nameTag, blk, 4);
+    memcpy(&onEventTag, blk + 104, 4);
+
+    animParamsBody(z.at(a), blk);
+    z.putPtr(obj, field, a);
+
+    putXStringFromTag(r, z, a, 0, nameTag);
+    if (onEventTag != TAG_NULL) tEventHandler(r, z, a, 112, true);
+    else                        z.putPtr(a, 112, Prelink::none());
+}
+
+static void tUIAnimInfo(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc u = z.alloc(OUT, SZ_UIANIMINFO, 8);
+    b4Reserve(3, 236, u);
+
+    int32_t  stateCount = r.i32();
+    uint32_t statesTag  = r.u32();
+    uint8_t  cur[108] = {0}, nxt[108] = {0}, tail[12] = {0};
+    r.bytes(cur, 108);
+    r.bytes(nxt, 108);
+    r.bytes(tail, 12);                 // animating, animStartTime, animDuration
+
+    uint8_t *o = z.at(u);
+    memcpy(o, &stateCount, 4);
+    animParamsBody(o + 16,  cur);      // currentAnimState
+    animParamsBody(o + 136, nxt);      // nextAnimState
+    memcpy(o + 256, tail, 12);
+
+    z.putPtr(obj, field, u);
+
+    // Load_animParamsDef_ptr tests only against zero: any other value means
+    // the record follows inline.
+    if (statesTag == TAG_NULL) { z.putPtr(u, 8, Prelink::none()); return; }
+    int32_t n = stateCount > 0 ? stateCount : 0;
+    Prelink::Loc tbl = z.alloc(OUT, n ? (size_t)n * 8 : 1, 8);
+    b4Reserve(3, (uint32_t)n * 4, tbl);
+    std::vector<uint32_t> tags(n);
+    for (int i = 0; i < n; ++i) tags[i] = r.u32();
+    for (int i = 0; i < n; ++i)
+        if (tags[i] != TAG_NULL) tAnimParamsDef(r, z, tbl, (uint32_t)i * 8);
+    z.putPtr(u, 8, tbl);
+}
+
+// itemDef_s: 272 -> 336. Load_itemDef_t (db_load.cpp:5671) walks the window,
+// three dvar strings, the type-discriminated typeData union, rectExpData,
+// two expressions, the event handler and the animation info. `parent` is a
+// runtime backpointer and is never loaded.
+
+enum { SZ_ITEMDEF = 336, SZ_RECTDATA = 96 };
+
+static void tItemDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc it = z.alloc(OUT, SZ_ITEMDEF, 8);
+    const uint32_t itX86 = b4Reserve(7, 272, it);   // AllocLoad_itemDef_t, align 8
+
+    // --- the 272-byte fixed block ---
+    // window is inline at offset 0; tWindowDef reads its 164 bytes.
+    WindowTags wt = tWindowDefFixed(r, z, it);
+
+    uint8_t  mid[12];                      // type, dataType, imageTrack
+    r.bytes(mid, 12);
+    uint32_t dvarTag       = r.u32();
+    uint32_t dvarTestTag   = r.u32();
+    uint32_t enableDvarTag = r.u32();
+    int32_t  dvarFlags     = r.i32();
+    uint32_t typeDataTag   = r.u32();
+    r.u32();                               // parent -- runtime only
+    uint32_t rectExpTag    = r.u32();
+
+    uint32_t visFileTag = r.u32();
+    int32_t  visLine    = r.i32();
+    int32_t  visNumRpn  = r.i32();
+    uint32_t visRpnTag  = r.u32();
+    r.skip(4);                             // x86 padding before showBits
+
+    uint8_t  bits[16];                     // showBits, hideBits
+    r.bytes(bits, 16);
+
+    uint32_t foreFileTag = r.u32();
+    int32_t  foreLine    = r.i32();
+    int32_t  foreNumRpn  = r.i32();
+    uint32_t foreRpnTag  = r.u32();
+
+    int32_t  ui3dWindowId = r.i32();
+    uint32_t onEventTag   = r.u32();
+    uint32_t animInfoTag  = r.u32();
+    r.skip(4);                             // trailing x86 padding (align 8)
+
+    uint8_t *o = z.at(it);
+    memcpy(o + 176, mid, 12);
+    memcpy(o + 216, &dvarFlags, 4);
+    memcpy(o + 256, &visLine, 4);          // visibleExp.line
+    memcpy(o + 260, &visNumRpn, 4);
+    memcpy(o + 272, bits, 16);
+    memcpy(o + 296, &foreLine, 4);         // forecolorAExp.line
+    memcpy(o + 300, &foreNumRpn, 4);
+    memcpy(o + 312, &ui3dWindowId, 4);
+
+    z.putPtr(obj, field, it);
+
+    // --- referenced data, in load order ---
+    {
+        int32_t ty; memcpy(&ty, mid, 4);
+        mtrace(r, "itemDef type", ty, wt.name);
+    }
+    tWindowDefRefs(r, z, it, wt, itX86);
+    putXStringFromTag(r, z, it, 192, dvarTag);
+    putXStringFromTag(r, z, it, 200, dvarTestTag);
+    putXStringFromTag(r, z, it, 208, enableDvarTag);
+
+    // typeData -- Load_itemDefData_t (db_load.cpp:5620)
+    int32_t itemType;
+    memcpy(&itemType, mid, 4);
+    if (typeDataTag == TAG_NULL) {
+        z.putPtr(it, 224, Prelink::none());
+    } else switch (itemType) {
+    case 1: case 3: case 0xF: case 0x12: case 0x14: case 4: case 0xA:
+    case 5: case 0xE: case 7: case 0xD: case 9: case 0xC: case 0x10:
+    case 8: case 0xB: case 0x16:
+        tTextDef(r, z, it, 224, itemType); break;
+    case 2:                                      // imageDef_s
+    case 6:                                      // ownerDrawDef_s
+        tExprWrapper(r, z, it, 224); break;
+    case 0x15: case 0x13:                        // blankButtonDef
+        tFocusItemDef(r, z, it, 224, itemType); break;
+    default:
+        z.putPtr(it, 224, Prelink::none()); break;
+    }
+
+    if (rectExpTag != TAG_NULL) {
+        Prelink::Loc rd = z.alloc(OUT, SZ_RECTDATA, 8);
+        b4Reserve(3, 64, rd);
+        // Load_rectData_t (db_load.cpp:5605) reads the whole 64-byte block --
+        // all four ExpressionStatement headers -- and only then calls
+        // Load_ExpressionStatement(0) four times, which re-read nothing.
+        // Interleaving header and referenced data reads the first rpn array
+        // out of the following headers.
+        uint32_t fileTag[4], rpnTag[4];
+        int32_t  numRpn[4];
+        for (int i = 0; i < 4; ++i) {
+            fileTag[i]    = r.u32();
+            int32_t line  = r.i32();
+            numRpn[i]     = r.i32();
+            rpnTag[i]     = r.u32();
+            uint8_t *d = z.at(rd) + (uint32_t)i * SZ_EXPRSTMT;
+            memcpy(d + 8,  &line, 4);
+            memcpy(d + 12, &numRpn[i], 4);
+        }
+        for (int i = 0; i < 4; ++i) {
+            Prelink::Loc e{rd.blk, rd.off + (uint32_t)i * SZ_EXPRSTMT};
+            putXStringFromTag(r, z, e, 0, fileTag[i]);
+            tExprRpnArray(r, z, e, 16, rpnTag[i], numRpn[i]);
+        }
+        z.putPtr(it, 240, rd);
+    }
+
+    // visibleExp and forecolorAExp: their headers were read above, only the
+    // referenced parts follow now.
+    putXStringFromTag(r, z, it, 248, visFileTag);
+    tExprRpnArray(r, z, it, 264, visRpnTag, visNumRpn);
+    putXStringFromTag(r, z, it, 288, foreFileTag);
+    tExprRpnArray(r, z, it, 304, foreRpnTag, foreNumRpn);
+
+    if (onEventTag != TAG_NULL)
+        tEventHandler(r, z, it, 320, true);
+
+    if (animInfoTag != TAG_NULL) tUIAnimInfo(r, z, it, 328);
+    else                         z.putPtr(it, 328, Prelink::none());
+}
+
+// menuDef_t: 400 -> 456. The root of the UI tree.
+enum { SZ_MENUDEF = 456 };
+
+static Prelink::Loc tMenuDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc m = z.alloc(OUT, SZ_MENUDEF, 8);
+    tempReserve(400);                      // Load_menuDef_ptr -> block 0
+
+    WindowTags wt = tWindowDefFixed(r, z, m);            // window is inline at offset 0
+
+    uint32_t fontTag = r.u32();
+    uint8_t  ints15[60];                   // fullScreen .. closeSlideDirection
+    r.bytes(ints15, 60);
+    uint8_t  initialRect[24];
+    r.bytes(initialRect, 24);
+    uint8_t  ints4[16] = {0};                   // the four fade/slide counters
+    r.bytes(ints4, 16);
+
+    uint32_t onEventTag = r.u32();
+    uint32_t onKeyTag   = r.u32();
+
+    uint32_t visFileTag = r.u32();
+    int32_t  visLine    = r.i32();
+    int32_t  visNumRpn  = r.i32();
+    uint32_t visRpnTag  = r.u32();
+    r.skip(4);                             // x86 padding before showBits
+
+    uint8_t  bits[16] = {0};
+    r.bytes(bits, 16);
+
+    uint32_t allowedTag = r.u32();
+    uint32_t soundTag   = r.u32();
+    uint8_t  trackCtl[8];                  // imageTrack, control
+    r.bytes(trackCtl, 8);
+    uint8_t  colors[32];                   // focusColor, disableColor
+    r.bytes(colors, 32);
+
+    uint32_t rxFileTag = r.u32();
+    int32_t  rxLine    = r.i32();
+    int32_t  rxNumRpn  = r.i32();
+    uint32_t rxRpnTag  = r.u32();
+
+    uint32_t ryFileTag = r.u32();
+    int32_t  ryLine    = r.i32();
+    int32_t  ryNumRpn  = r.i32();
+    uint32_t ryRpnTag  = r.u32();
+
+    uint32_t itemsTag = r.u32();
+    r.skip(4);                             // trailing x86 padding
+
+    uint8_t *o = z.at(m);
+    memcpy(o + 184, ints15, 60);
+    memcpy(o + 244, initialRect, 24);
+    memcpy(o + 268, ints4, 16);
+    memcpy(o + 312, &visLine, 4);          // visibleExp.line
+    memcpy(o + 316, &visNumRpn, 4);        // visibleExp.numRpn
+    memcpy(o + 328, bits, 16);             // showBits, hideBits
+    memcpy(o + 360, trackCtl, 8);          // imageTrack, control
+    memcpy(o + 368, colors, 32);           // focusColor, disableColor
+    memcpy(o + 408, &rxLine, 4);           // rectXExp.line
+    memcpy(o + 412, &rxNumRpn, 4);
+    memcpy(o + 432, &ryLine, 4);           // rectYExp.line
+    memcpy(o + 436, &ryNumRpn, 4);
+    int32_t itemCount;
+    memcpy(&itemCount, ints15 + 8, 4);
+
+    z.putPtr(obj, field, m);
+
+    // --- referenced data, in Load_menuDef_t order ---
+    mtrace(r, "menuDef itemCount", itemCount, wt.name);
+    tWindowDefRefs(r, z, m, wt);
+    putXStringFromTag(r, z, m, 176, fontTag);
+
+    if (onEventTag != TAG_NULL) tEventHandler(r, z, m, 288, true);
+    if (onKeyTag   != TAG_NULL) tEventHandler(r, z, m, 296, false);
+
+    // visibleExp is {filename 304, line 312, numRpn 316, rpn 320}; showBits
+    // starts at 328. The rpn pointer used to be written at 328, over showBits,
+    // which hid every menu with a 'visible when' -- all the popups -- through
+    // Menu_IsVisible's show-bits test, and left the expression without its
+    // program.
+    putXStringFromTag(r, z, m, 304, visFileTag);
+    tExprRpnArray(r, z, m, 320, visRpnTag, visNumRpn);
+
+    putXStringFromTag(r, z, m, 344, allowedTag);
+    putXStringFromTag(r, z, m, 352, soundTag);
+
+    putXStringFromTag(r, z, m, 400, rxFileTag);
+    tExprRpnArray(r, z, m, 416, rxRpnTag, rxNumRpn);
+    putXStringFromTag(r, z, m, 424, ryFileTag);
+    tExprRpnArray(r, z, m, 440, ryRpnTag, ryNumRpn);
+
+    if (itemsTag != TAG_NULL) {
+        Prelink::Loc tbl = z.alloc(OUT, (size_t)itemCount * 8, 8);
+        b4Reserve(3, (uint32_t)itemCount * 4, tbl);
+        std::vector<uint32_t> tags(itemCount);
+        for (int i = 0; i < itemCount; ++i) tags[i] = r.u32();
+        for (int i = 0; i < itemCount; ++i)
+            if (tags[i] != TAG_NULL) {
+                g_itemIdx = i;
+                tItemDef(r, z, tbl, (uint32_t)i * 8);
+            }
+        z.putPtr(m, 448, tbl);
+    }
+    return m;
+}    
+
+// ---- fx ---------------------------------------------------------------------
+// FxEffectDef -> FxElemDef[] -> visuals / trail / sounds.
+// FxEffectDefRef is a union of {const FxEffectDef*; const char* name} and the
+// loader always takes the string branch (Load_FxEffectDefRef -> Load_XString);
+// the handle is resolved at runtime by Load_FxEffectDefFromName.
+
+enum {
+    AT_WEAPON      = 0x18,
+    AT_FX          = 0x1C,
+    SZ_FXEFFECTDEF = 72,    // x86 60
+    SZ_FXELEMDEF   = 336,   // x86 292
+    SZ_FXTRAILDEF  = 40,    // x86 28
+    SZ_FXMARKVIS   = 16,    // x86 8, two material handles
+    SZ_FXVISUALS   = 8      // x86 4, a union of one pointer
+};
+
+// A flat array of pointer-free records copies across byte for byte. It cannot
+// go through tSimpleArray, which derives the output alignment from the element
+// size -- 96, 48 and 20 here are not powers of two.
+static void tFlatArray(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                       uint32_t nbytes, uint32_t allocParam) {
+    Prelink::Loc b = z.alloc(OUT, nbytes ? nbytes : 1, 4);
+    if (nbytes) r.bytes(z.at(b), nbytes);
+    b4Reserve(allocParam, nbytes, b);
+    z.putPtr(obj, field, b);
+}
+
+// FxElemVisuals: what the 4-byte union holds is decided by the elem type
+// (Load_FxElemVisuals, db_load.cpp:3889). Types 8 and 9 load nothing at all --
+// FX_CopyVisuals zeroes the slot for them -- so the slot is left null here too.
+static void tXModelHandle(Reader &r, Prelink &z, Prelink::Loc obj,
+                          uint32_t field, uint32_t tag, uint32_t x86slot = 0);
+
+static void tFxElemVisuals(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                           uint8_t elemType, uint32_t tag, uint32_t x86slot = 0) {
+    switch (elemType) {
+    case 7:                                          // XModel
+        tXModelHandle(r, z, obj, field, tag, x86slot);
+        break;
+    case 0xC:                                        // FxEffectDefRef, by name
+        putXStringFromTag(r, z, obj, field, tag);
+        markFxRef(z, obj, field);
+        break;
+    case 0xA:                                        // soundName
+        putXStringFromTag(r, z, obj, field, tag);
+        break;
+    case 8: case 9:
+        z.putPtr(obj, field, Prelink::none());
+        break;
+    default:
+        tMaterialHandle(r, z, obj, field, tag, x86slot);
+        break;
+    }
+}
+
+// FxElemDefVisuals (db_load.cpp:3947): elemType 11 means an array of
+// FxElemMarkVisuals, visualCount > 1 an array of FxElemVisuals, and anything
+// else a single inline FxElemVisuals.
+static void tFxElemDefVisuals(Reader &r, Prelink &z, Prelink::Loc ed, uint32_t field,
+                              uint8_t elemType, uint8_t visualCount, uint32_t tag,
+                              uint32_t x86slot = 0) {
+    if (elemType == 11) {
+        if (tag == TAG_NULL) { z.putPtr(ed, field, Prelink::none()); return; }
+        Prelink::Loc tbl = z.alloc(OUT, (size_t)visualCount * SZ_FXMARKVIS, 8);
+        const uint32_t tblX86 = b4Reserve(3, (uint32_t)visualCount * 8, tbl);
+        std::vector<uint32_t> mats((size_t)visualCount * 2);
+        for (size_t i = 0; i < mats.size(); ++i) mats[i] = r.u32();
+        for (int i = 0; i < visualCount; ++i) {
+            Prelink::Loc mv{tbl.blk, tbl.off + (uint32_t)i * SZ_FXMARKVIS};
+            tMaterialHandle(r, z, mv, 0, mats[(size_t)i * 2], tblX86 + (uint32_t)i * 8);
+            tMaterialHandle(r, z, mv, 8, mats[(size_t)i * 2 + 1], tblX86 + (uint32_t)i * 8 + 4);
+        }
+        z.putPtr(ed, field, tbl);
+    } else if (visualCount > 1) {
+        if (tag == TAG_NULL) { z.putPtr(ed, field, Prelink::none()); return; }
+        Prelink::Loc tbl = z.alloc(OUT, (size_t)visualCount * SZ_FXVISUALS, 8);
+        const uint32_t tblX86 = b4Reserve(3, (uint32_t)visualCount * 4, tbl);
+        std::vector<uint32_t> tags(visualCount);
+        for (int i = 0; i < visualCount; ++i) tags[i] = r.u32();
+        for (int i = 0; i < visualCount; ++i)
+            tFxElemVisuals(r, z, Prelink::Loc{tbl.blk, tbl.off + (uint32_t)i * SZ_FXVISUALS},
+                           0, elemType, tags[i], tblX86 + (uint32_t)i * 4);
+        z.putPtr(ed, field, tbl);
+    } else {
+        tFxElemVisuals(r, z, ed, field, elemType, tag, x86slot);
+    }
+}
+
+// FxTrailDef: 28 -> 40. FxTrailVertex is 20 flat floats and does not widen.
+static void tFxTrailDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc td = z.alloc(OUT, SZ_FXTRAILDEF, 8);
+    b4Reserve(3, 28, td);
+
+    uint8_t  head[16];                     // scrollTimeMsec .. vertCount
+    r.bytes(head, 16);
+    uint32_t vertsTag = r.u32();
+    int32_t  indCount = r.i32();
+    uint32_t indsTag  = r.u32();
+
+    int32_t vertCount;
+    memcpy(&vertCount, head + 12, 4);
+
+    uint8_t *o = z.at(td);
+    memcpy(o, head, 16);
+    memcpy(o + 24, &indCount, 4);
+
+    z.putPtr(obj, field, td);
+
+    if (vertsTag != TAG_NULL)
+        tFlatArray(r, z, td, 16, 20u * (uint32_t)(vertCount > 0 ? vertCount : 0), 3);
+    else
+        z.putPtr(td, 16, Prelink::none());
+
+    if (indsTag != TAG_NULL)                       // AllocLoad_XBlendInfo -> align 2
+        tSimpleArray(r, z, td, 32, indsTag, (uint32_t)(indCount > 0 ? indCount : 0), 2, 1);
+    else
+        z.putPtr(td, 32, Prelink::none());
+}
+
+// FxElemDef: 292 -> 336. Two padding holes open up, before velSamples (x86 188)
+// and before spawnSound (x86 280); everything else shifts by whole pointers.
+struct FxElemTags {
+    uint32_t velSamples, visSamples, visuals;
+    uint32_t onImpact, onDeath, emitted, attached;
+    uint32_t trailDef, spawnSound;
+    uint8_t  elemType, visualCount, velIntervals, visIntervals;
+};
+
+static FxElemTags tFxElemDefFixed(Reader &r, Prelink &z, Prelink::Loc ed) {
+    FxElemTags t;
+    uint8_t head[188];                     // flags .. visStateIntervalCount
+    r.bytes(head, 188);
+    t.velSamples = r.u32();
+    t.visSamples = r.u32();
+    t.visuals    = r.u32();
+    uint8_t coll[24];                      // collMins[3], collMaxs[3]
+    r.bytes(coll, 24);
+    t.onImpact = r.u32();
+    t.onDeath  = r.u32();
+    t.emitted  = r.u32();
+    uint8_t emit[16];                      // emitDist, emitDistVariance
+    r.bytes(emit, 16);
+    t.attached = r.u32();
+    t.trailDef = r.u32();
+    uint8_t tail[12];                      // sortOrder .. lifespanAtMaxWind
+    r.bytes(tail, 12);
+    uint8_t u[8];                          // FxElemDefUnion
+    r.bytes(u, 8);
+    t.spawnSound = r.u32();
+    uint8_t pivot[8];                      // billboardPivot[2]
+    r.bytes(pivot, 8);
+
+    uint8_t *o = z.at(ed);
+    memcpy(o,       head, 188);
+    memcpy(o + 216, coll, 24);
+    memcpy(o + 264, emit, 16);
+    memcpy(o + 296, tail, 12);
+    memcpy(o + 308, u, 8);
+    memcpy(o + 328, pivot, 8);
+
+    t.elemType     = head[184];
+    t.visualCount  = head[185];
+    t.velIntervals = head[186];
+    t.visIntervals = head[187];
+    return t;
+}
+
+static void tFxElemDefRefs(Reader &r, Prelink &z, Prelink::Loc ed, const FxElemTags &t,
+                           uint32_t edX86 = 0) {
+    // FxElemVelStateSample is 96 flat bytes, FxElemVisStateSample 48; neither
+    // holds a pointer, so both arrays copy across unchanged.
+    if (t.velSamples != TAG_NULL)
+        tFlatArray(r, z, ed, 192, 96u * ((uint32_t)t.velIntervals + 1), 3);
+    else
+        z.putPtr(ed, 192, Prelink::none());
+
+    if (t.visSamples != TAG_NULL)
+        tFlatArray(r, z, ed, 200, 48u * ((uint32_t)t.visIntervals + 1), 3);
+    else
+        z.putPtr(ed, 200, Prelink::none());
+
+    tFxElemDefVisuals(r, z, ed, 208, t.elemType, t.visualCount, t.visuals,
+                      edX86 ? edX86 + 196 : 0);   // FxElemDef.visuals
+
+    putXStringFromTag(r, z, ed, 240, t.onImpact);   markFxRef(z, ed, 240);
+    putXStringFromTag(r, z, ed, 248, t.onDeath);    markFxRef(z, ed, 248);
+    putXStringFromTag(r, z, ed, 256, t.emitted);    markFxRef(z, ed, 256);
+    putXStringFromTag(r, z, ed, 280, t.attached);   markFxRef(z, ed, 280);
+
+    if (t.trailDef != TAG_NULL) tFxTrailDef(r, z, ed, 288);
+    else                        z.putPtr(ed, 288, Prelink::none());
+
+    putXStringFromTag(r, z, ed, 320, t.spawnSound);
+}
+
+// FxEffectDef: 60 -> 72. Load_FxElemDefArray reads every 292-byte elem block
+// as one run before walking them, so the two phases stay separate here too.
+static void tFxEffectDef(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag = r.u32();
+    uint8_t  flags[4];                     // flags, efPriority, reserved[2]
+    r.bytes(flags, 4);
+    int32_t  totalSize    = r.i32();
+    int32_t  msecLooping  = r.i32();
+    int32_t  countLooping = r.i32();
+    int32_t  countOneShot = r.i32();
+    int32_t  countEmit    = r.i32();
+    uint32_t elemDefsTag  = r.u32();
+    uint8_t  bounds[28];                   // boundingBoxDim[3], boundingSphere[4]
+    r.bytes(bounds, 28);
+
+    uint8_t *o = z.at(obj);
+    memcpy(o + 8,  flags, 4);
+    memcpy(o + 12, &totalSize, 4);
+    memcpy(o + 16, &msecLooping, 4);
+    memcpy(o + 20, &countLooping, 4);
+    memcpy(o + 24, &countOneShot, 4);
+    memcpy(o + 28, &countEmit, 4);
+    memcpy(o + 40, bounds, 28);
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+
+    const int32_t count = countEmit + countOneShot + countLooping;
+    if (elemDefsTag == TAG_NULL || count <= 0) {
+        z.putPtr(obj, 32, Prelink::none());
+        return;
+    }
+
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)count * SZ_FXELEMDEF, 8);
+    const uint32_t tblX86 = b4Reserve(3, (uint32_t)count * 292, tbl);
+
+    std::vector<FxElemTags> tags(count);
+    for (int i = 0; i < count; ++i)
+        tags[i] = tFxElemDefFixed(r, z, Prelink::Loc{tbl.blk, tbl.off + (uint32_t)i * SZ_FXELEMDEF});
+    for (int i = 0; i < count; ++i)
+        tFxElemDefRefs(r, z, Prelink::Loc{tbl.blk, tbl.off + (uint32_t)i * SZ_FXELEMDEF}, tags[i],
+                       tblX86 + (uint32_t)i * 292);
+
+    z.putPtr(obj, 32, tbl);
+}
+
+// ---- weapons ----------------------------------------------------------------
+// WeaponDef is 2056 bytes of mostly flat scalars with 130-odd pointers sprinkled
+// through it, and WeaponVariantDef and flameTable are the same shape. Counting
+// those offsets by hand is not worth the risk, so the three tables below are
+// generated from the headers (tools/ffconv/layout.py) and checked against the
+// x86 `sizeof=` annotation before being pasted in.
+//
+// Each table is a set of {x86 offset, LP64 offset, byte count} runs of
+// pointer-free data plus a list of {x86 offset, LP64 offset} pointer slots.
+// tReadFixed walks the x86 block once: it copies the runs, collects each
+// pointer slot as its raw stream tag, and skips whatever padding is left over.
+
+struct FixedBlock {
+    std::unordered_map<uint32_t, uint32_t> tag;   // LP64 offset -> stream tag
+    std::unordered_map<uint32_t, uint32_t> x86;   // LP64 offset -> x86 offset
+    uint32_t base = 0;                            // struct's own block-4 offset
+
+    // Absolute x86 offset of a pointer slot, or 0 when the struct does not
+    // live in block 4 and so cannot be aliased.
+    uint32_t slot(uint32_t lp64off) const {
+        if (!base) return 0;
+        auto it = x86.find(lp64off);
+        return it == x86.end() ? 0 : base + it->second;
+    }
+
+    // Looking up an offset that is not a pointer slot means the caller mistyped
+    // one; that must not silently turn into a null.
+    uint32_t at(uint32_t lp64off) const {
+        auto it = tag.find(lp64off);
+        if (it == tag.end()) {
+            fprintf(stderr, "internal: no pointer slot at LP64 offset %u\n", lp64off);
+            exit(30);
+        }
+        return it->second;
+    }
+};
+
+static FixedBlock tReadFixed(Reader &r, Prelink &z, Prelink::Loc obj,
+                             uint32_t x86size,
+                             const uint32_t (*flat)[3], size_t nflat,
+                             const uint32_t (*ptrs)[2], size_t nptrs,
+                             uint32_t x86base = 0) {
+    FixedBlock fb;
+    fb.base = x86base;
+    uint32_t cur = 0;
+    size_t fi = 0, pi = 0;
+    while (fi < nflat || pi < nptrs) {
+        const bool takeFlat = pi == nptrs ||
+                              (fi < nflat && flat[fi][0] < ptrs[pi][0]);
+        const uint32_t at = takeFlat ? flat[fi][0] : ptrs[pi][0];
+        if (at > cur) { r.skip(at - cur); cur = at; }   // x86 padding
+        if (takeFlat) {
+            r.bytes(z.at(obj) + flat[fi][1], flat[fi][2]);
+            cur += flat[fi][2];
+            ++fi;
+        } else {
+            fb.tag[ptrs[pi][1]] = r.u32();
+            fb.x86[ptrs[pi][1]] = ptrs[pi][0];
+            cur += 4;
+            ++pi;
+        }
+    }
+    if (x86size > cur) r.skip(x86size - cur);           // trailing padding
+    return fb;
+}
+
+// generated from the header: x86 2056 -> LP64 2664
+enum { SZ_WEAPONDEF = 2664, X86SZ_WEAPONDEF = 2056 };
+static const uint32_t kWeaponDefFlat[][3] = {
+    {   24,    48,    36},   // playerAnimType .. itemIndex
+    {   64,    96,    34},   // iJamFireTime .. fuelTankWeapon
+    {  100,   132,    16},   // iTankLifeTime .. stance
+    {  388,   696,    12},   // standMountedIndex .. proneMountedIndex
+    {  424,   760,   356},   // iReticleCenterSize .. fProneRotMinSpeed
+    {  804,  1168,     4},   // hudIconRatio
+    {  812,  1184,     4},   // indicatorIconRatio
+    {  820,  1200,    24},   // ammoCounterIconRatio .. shotCount
+    {  848,  1232,    10},   // iSharedAmmoCapIndex .. ammoCountClipRelative
+    {  860,  1244,    26},   // damage .. explosionTag
+    {  888,  1272,    28},   // iFireDelay .. spinRate
+    {  940,  1352,   211},   // iFireTime .. avoidDropCleanup
+    { 1152,  1564,    12},   // stackFire .. stackFireAccuracyDecay
+    { 1168,  1584,     9},   // autoAimRange .. mountableWeapon
+    { 1180,  1596,     9},   // aimPadding .. crosshairColorChange
+    { 1192,  1608,   174},   // moveSpeedScale .. bReloadWhileAds
+    { 1368,  1784,    31},   // adsViewErrorMin .. bUseOnlyAltWeaoponHideTagsInAltMode
+    { 1404,  1824,    16},   // killIconRatio .. iReloadStartAdd
+    { 1428,  1856,    22},   // dualWieldWeaponIndex .. bShowIndicator
+    { 1452,  1880,    60},   // isRollingGrenade .. projectileCurvature
+    { 1516,  1952,     4},   // projExplosion
+    { 1524,  1968,     1},   // projExplosionEffectForceNormalUp
+    { 1532,  1984,     1},   // projExplosionEffect2ForceNormalUp
+    { 1540,  2000,     1},   // projExplosionEffect3ForceNormalUp
+    { 1548,  2016,     1},   // projExplosionEffect4ForceNormalUp
+    { 1556,  2032,     1},   // projExplosionEffect5ForceNormalUp
+    { 1580,  2080,     2},   // bProjImpactExplode .. bBulletImpactExplode
+    { 1584,  2084,    17},   // stickiness .. freezeMovementWhenFiring
+    { 1604,  2104,    11},   // lowAmmoWarningThreshold .. isAcousticSensor
+    { 1628,  2144,    24},   // vProjectileColor .. projIgnitionDelay
+    { 1660,  2184,   152},   // fAdsAimPitch .. maxDist
+    { 1836,  2384,    88},   // accuracyGraphKnotCount .. fPlayerPositionDist
+    { 1932,  2488,    16},   // iUseHintStringIndex .. vertViewJitter
+    { 1952,  2512,    28},   // minDamage .. destabilizeDistance
+    { 1996,  2576,    28},   // adsDofStart .. scanPauseTime
+    { 2048,  2656,     1},   // doGibbing
+    { 2052,  2660,     4},   // maxGibDistance
+};
+static const uint32_t kWeaponDefPtrs[][2] = {
+    {    0,     0},   // szOverlayName
+    {    4,     8},   // gunXModel
+    {    8,    16},   // handXModel
+    {   12,    24},   // szModeName
+    {   16,    32},   // notetrackSoundMapKeys
+    {   20,    40},   // notetrackSoundMapValues
+    {   60,    88},   // parentWeaponName
+    {  116,   152},   // viewFlashEffect
+    {  120,   160},   // worldFlashEffect
+    {  124,   168},   // pickupSound
+    {  128,   176},   // pickupSoundPlayer
+    {  132,   184},   // ammoPickupSound
+    {  136,   192},   // ammoPickupSoundPlayer
+    {  140,   200},   // projectileSound
+    {  144,   208},   // pullbackSound
+    {  148,   216},   // pullbackSoundPlayer
+    {  152,   224},   // fireSound
+    {  156,   232},   // fireSoundPlayer
+    {  160,   240},   // fireLoopSound
+    {  164,   248},   // fireLoopSoundPlayer
+    {  168,   256},   // fireLoopEndSound
+    {  172,   264},   // fireLoopEndSoundPlayer
+    {  176,   272},   // fireStopSound
+    {  180,   280},   // fireStopSoundPlayer
+    {  184,   288},   // fireLastSound
+    {  188,   296},   // fireLastSoundPlayer
+    {  192,   304},   // emptyFireSound
+    {  196,   312},   // emptyFireSoundPlayer
+    {  200,   320},   // crackSound
+    {  204,   328},   // whizbySound
+    {  208,   336},   // meleeSwipeSound
+    {  212,   344},   // meleeSwipeSoundPlayer
+    {  216,   352},   // meleeHitSound
+    {  220,   360},   // meleeMissSound
+    {  224,   368},   // rechamberSound
+    {  228,   376},   // rechamberSoundPlayer
+    {  232,   384},   // reloadSound
+    {  236,   392},   // reloadSoundPlayer
+    {  240,   400},   // reloadEmptySound
+    {  244,   408},   // reloadEmptySoundPlayer
+    {  248,   416},   // reloadStartSound
+    {  252,   424},   // reloadStartSoundPlayer
+    {  256,   432},   // reloadEndSound
+    {  260,   440},   // reloadEndSoundPlayer
+    {  264,   448},   // rotateLoopSound
+    {  268,   456},   // rotateLoopSoundPlayer
+    {  272,   464},   // deploySound
+    {  276,   472},   // deploySoundPlayer
+    {  280,   480},   // finishDeploySound
+    {  284,   488},   // finishDeploySoundPlayer
+    {  288,   496},   // breakdownSound
+    {  292,   504},   // breakdownSoundPlayer
+    {  296,   512},   // finishBreakdownSound
+    {  300,   520},   // finishBreakdownSoundPlayer
+    {  304,   528},   // detonateSound
+    {  308,   536},   // detonateSoundPlayer
+    {  312,   544},   // nightVisionWearSound
+    {  316,   552},   // nightVisionWearSoundPlayer
+    {  320,   560},   // nightVisionRemoveSound
+    {  324,   568},   // nightVisionRemoveSoundPlayer
+    {  328,   576},   // altSwitchSound
+    {  332,   584},   // altSwitchSoundPlayer
+    {  336,   592},   // raiseSound
+    {  340,   600},   // raiseSoundPlayer
+    {  344,   608},   // firstRaiseSound
+    {  348,   616},   // firstRaiseSoundPlayer
+    {  352,   624},   // putawaySound
+    {  356,   632},   // putawaySoundPlayer
+    {  360,   640},   // overheatSound
+    {  364,   648},   // overheatSoundPlayer
+    {  368,   656},   // adsZoomSound
+    {  372,   664},   // bounceSound
+    {  376,   672},   // standMountedWeapdef
+    {  380,   680},   // crouchMountedWeapdef
+    {  384,   688},   // proneMountedWeapdef
+    {  400,   712},   // viewShellEjectEffect
+    {  404,   720},   // worldShellEjectEffect
+    {  408,   728},   // viewLastShotEjectEffect
+    {  412,   736},   // worldLastShotEjectEffect
+    {  416,   744},   // reticleCenter
+    {  420,   752},   // reticleSide
+    {  780,  1120},   // worldModel
+    {  784,  1128},   // worldClipModel
+    {  788,  1136},   // rocketModel
+    {  792,  1144},   // mountedModel
+    {  796,  1152},   // additionalMeleeModel
+    {  800,  1160},   // hudIcon
+    {  808,  1176},   // indicatorIcon
+    {  816,  1192},   // ammoCounterIcon
+    {  844,  1224},   // szSharedAmmoCapName
+    {  916,  1304},   // spinLoopSound
+    {  920,  1312},   // spinLoopSoundPlayer
+    {  924,  1320},   // startSpinSound
+    {  928,  1328},   // startSpinSoundPlayer
+    {  932,  1336},   // stopSpinSound
+    {  936,  1344},   // stopSpinSoundPlayer
+    { 1164,  1576},   // stackSound
+    { 1400,  1816},   // killIcon
+    { 1420,  1840},   // szSpawnedGrenadeWeaponName
+    { 1424,  1848},   // szDualWieldWeaponName
+    { 1512,  1944},   // projectileModel
+    { 1520,  1960},   // projExplosionEffect
+    { 1528,  1976},   // projExplosionEffect2
+    { 1536,  1992},   // projExplosionEffect3
+    { 1544,  2008},   // projExplosionEffect4
+    { 1552,  2024},   // projExplosionEffect5
+    { 1560,  2040},   // projDudEffect
+    { 1564,  2048},   // projExplosionSound
+    { 1568,  2056},   // projDudSound
+    { 1572,  2064},   // mortarShellSound
+    { 1576,  2072},   // tankShellSound
+    { 1616,  2120},   // parallelBounce
+    { 1620,  2128},   // perpendicularBounce
+    { 1624,  2136},   // projTrailEffect
+    { 1652,  2168},   // projIgnitionEffect
+    { 1656,  2176},   // projIgnitionSound
+    { 1812,  2336},   // accuracyGraphName[0]
+    { 1816,  2344},   // accuracyGraphName[1]
+    { 1820,  2352},   // accuracyGraphKnots[0]
+    { 1824,  2360},   // accuracyGraphKnots[1]
+    { 1828,  2368},   // originalAccuracyGraphKnots[0]
+    { 1832,  2376},   // originalAccuracyGraphKnots[1]
+    { 1924,  2472},   // szUseHintString
+    { 1928,  2480},   // dropHintString
+    { 1948,  2504},   // szScript
+    { 1980,  2544},   // locationDamageMultipliers
+    { 1984,  2552},   // fireRumble
+    { 1988,  2560},   // meleeImpactRumble
+    { 1992,  2568},   // reloadRumble
+    { 2024,  2608},   // flameTableFirstPerson
+    { 2028,  2616},   // flameTableThirdPerson
+    { 2032,  2624},   // flameTableFirstPersonPtr
+    { 2036,  2632},   // flameTableThirdPersonPtr
+    { 2040,  2640},   // tagFx_preparationEffect
+    { 2044,  2648},   // tagFlash_preparationEffect
+};
+
+// generated from the header: x86 228 -> LP64 288
+enum { SZ_WEAPONVARIANTDEF = 288, X86SZ_WEAPONVARIANTDEF = 228 };
+static const uint32_t kWeaponVariantDefFlat[][3] = {
+    {    4,     8,     4},   // iVariantCount
+    {   28,    56,    36},   // altWeaponIndex .. iAltRaiseTime
+    {   68,   104,     4},   // iAmmoIndex
+    {   76,   120,    61},   // iClipIndex .. bRapidFire
+    {  152,   208,    76},   // dpadIconRatio .. ikLeftHandUiViewerRotation
+};
+static const uint32_t kWeaponVariantDefPtrs[][2] = {
+    {    0,     0},   // szInternalName
+    {    8,    16},   // weapDef
+    {   12,    24},   // szDisplayName
+    {   16,    32},   // szXAnims
+    {   20,    40},   // szAltWeaponName
+    {   24,    48},   // hideTags
+    {   64,    96},   // szAmmoName
+    {   72,   112},   // szClipName
+    {  140,   184},   // overlayMaterial
+    {  144,   192},   // overlayMaterialLowRes
+    {  148,   200},   // dpadIcon
+};
+
+// generated from the header: x86 476 -> LP64 528
+enum { SZ_FLAMETABLE = 528, X86SZ_FLAMETABLE = 476 };
+static const uint32_t kFlameTableFlat[][3] = {
+    {    0,     0,   424},   // flameVar_streamChunkGravityStart .. flameVar_collisionVolumeScale
+};
+static const uint32_t kFlameTablePtrs[][2] = {
+    {  424,   424},   // name
+    {  428,   432},   // fire
+    {  432,   440},   // smoke
+    {  436,   448},   // heat
+    {  440,   456},   // drips
+    {  444,   464},   // streamFuel
+    {  448,   472},   // streamFuel2
+    {  452,   480},   // streamFlame
+    {  456,   488},   // streamFlame2
+    {  460,   496},   // flameOffLoopSound
+    {  464,   504},   // flameIgniteSound
+    {  468,   512},   // flameOnLoopSound
+    {  472,   520},   // flameCooldownSound
+};
+// Load_XModelPtr (db_load.cpp:3300) and Load_FxEffectDefHandle (3814) share the
+// asset-handle shape: -1 and -2 mean the asset follows inline, anything else
+// non-zero is an offset alias.
+static void tXModelHandle(Reader &r, Prelink &z, Prelink::Loc obj,
+                          uint32_t field, uint32_t tag, uint32_t x86slot) {
+    if (tag == TAG_INLINE || tag == TAG_ALIAS) {
+        Prelink::Loc m = z.alloc(OUT, SZ_XMODEL, 8);
+        tempReserve(252);      // Load_XModelPtr -> block 0
+        if (tag == TAG_ALIAS) g_aliasMap[insertPointerSlot()] = m;
+        noteAliasSlot(x86slot, m);
+        tXModel(r, z, m);
+        z.addAsset(AT_XMODEL, m);           // Load_XModelAsset, db_load.cpp:3319
+        z.putPtr(obj, field, m);
+    } else if (tag != TAG_NULL) {
+        noteAliasSlot(x86slot, putAssetHandleRef(z, obj, field, tag));
+    } else {
+        z.putPtr(obj, field, Prelink::none());
+    }
+}
+
+static void tFxEffectDefHandle(Reader &r, Prelink &z, Prelink::Loc obj,
+                               uint32_t field, uint32_t tag, uint32_t x86slot = 0) {
+    if (tag == TAG_INLINE || tag == TAG_ALIAS) {
+        Prelink::Loc f = z.alloc(OUT, SZ_FXEFFECTDEF, 8);
+        tempReserve(60);       // Load_FxEffectDefHandle -> block 0
+        if (tag == TAG_ALIAS) g_aliasMap[insertPointerSlot()] = f;
+        noteAliasSlot(x86slot, f);
+        tFxEffectDef(r, z, f);
+        z.addAsset(AT_FX, f);               // Load_FxEffectDefAsset, db_load.cpp:3833
+        z.putPtr(obj, field, f);
+    } else if (tag != TAG_NULL) {
+        noteAliasSlot(x86slot, putAssetHandleRef(z, obj, field, tag));
+    } else {
+        z.putPtr(obj, field, Prelink::none());
+    }
+}
+
+// An array of asset handles: the pointer run is read whole before the elements,
+// exactly as Load_XModelPtrArray and Load_XStringArray do.
+static void tXModelHandleArray(Reader &r, Prelink &z, Prelink::Loc obj,
+                               uint32_t field, uint32_t tag, uint32_t count) {
+    if (tag == TAG_NULL) { z.putPtr(obj, field, Prelink::none()); return; }
+    if (tag != TAG_INLINE) { putStructOffsetRef(z, obj, field, tag); return; }
+
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)count * 8, 8);
+    // Later asset aliases can reference any slot in this model array.
+    const uint32_t x86base = b4Reserve(3, count * 4, tbl);
+    std::vector<uint32_t> tags(count);
+    for (uint32_t i = 0; i < count; ++i) tags[i] = r.u32();
+    for (uint32_t i = 0; i < count; ++i)
+        tXModelHandle(r, z, Prelink::Loc{tbl.blk, tbl.off + i * 8}, 0, tags[i], x86base + i * 4);
+    z.putPtr(obj, field, tbl);
+}
+
+static void tXStringArrayPtr(Reader &r, Prelink &z, Prelink::Loc obj,
+                             uint32_t field, uint32_t tag, uint32_t count) {
+    if (tag == TAG_NULL) { z.putPtr(obj, field, Prelink::none()); return; }
+    if (tag != TAG_INLINE) { putStructOffsetRef(z, obj, field, tag); return; }
+
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)count * 8, 8);
+    b4Reserve(3, count * 4, tbl);
+    std::vector<uint32_t> tags(count);
+    for (uint32_t i = 0; i < count; ++i) tags[i] = r.u32();
+    for (uint32_t i = 0; i < count; ++i)
+        putXStringFromTag(r, z, tbl, i * 8, tags[i]);
+    z.putPtr(obj, field, tbl);
+}
+
+// flameTable: 476 -> 528. A block of floats followed by eight materials and
+// four sound names.
+static void tFlameTable(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                        uint32_t tag) {
+    if (tag == TAG_NULL) { z.putPtr(obj, field, Prelink::none()); return; }
+    if (tag != TAG_INLINE) { putStructOffsetRef(z, obj, field, tag); return; }
+
+    Prelink::Loc ft = z.alloc(OUT, SZ_FLAMETABLE, 8);
+    const uint32_t ftX86 = b4Reserve(3, X86SZ_FLAMETABLE, ft);
+    FixedBlock fb = tReadFixed(r, z, ft, X86SZ_FLAMETABLE,
+                               kFlameTableFlat, sizeof kFlameTableFlat / 12,
+                               kFlameTablePtrs, sizeof kFlameTablePtrs / 8, ftX86);
+    z.putPtr(obj, field, ft);
+
+    putXStringFromTag(r, z, ft, 424, fb.at(424));            // name
+    for (uint32_t o = 432; o <= 488; o += 8)                 // fire .. streamFlame2
+        tMaterialHandle(r, z, ft, o, fb.at(o), fb.slot(o));
+    for (uint32_t o = 496; o <= 520; o += 8)                 // the four sounds
+        putXStringFromTag(r, z, ft, o, fb.at(o));
+}
+
+// WeaponDef: 2056 -> 2664. Load_WeaponDef walks its references in an order that
+// is mostly, but not entirely, the field order -- indicatorIcon comes after
+// killIcon, and the two accuracy graphs are interleaved per index.
+static void tWeaponDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                       uint32_t tag) {
+    if (tag == TAG_NULL) { z.putPtr(obj, field, Prelink::none()); return; }
+    if (tag != TAG_INLINE) { putStructOffsetRef(z, obj, field, tag); return; }
+
+    Prelink::Loc w = z.alloc(OUT, SZ_WEAPONDEF, 8);
+    const uint32_t wX86 = b4Reserve(3, X86SZ_WEAPONDEF, w);
+    FixedBlock fb = tReadFixed(r, z, w, X86SZ_WEAPONDEF,
+                               kWeaponDefFlat, sizeof kWeaponDefFlat / 12,
+                               kWeaponDefPtrs, sizeof kWeaponDefPtrs / 8, wX86);
+    z.putPtr(obj, field, w);
+
+    putXStringFromTag(r, z, w, 0, fb.at(0));                 // szOverlayName
+    tXModelHandleArray(r, z, w, 8, fb.at(8), 16);            // gunXModel[16]
+    tXModelHandle(r, z, w, 16, fb.at(16), fb.slot(16));                   // handXModel
+    putXStringFromTag(r, z, w, 24, fb.at(24));               // szModeName
+
+    // notetrackSoundMapKeys / Values: 20 script strings, AllocLoad_XBlendInfo.
+    markScrStr(z, tOffsetOrArray(r, z, w, 32, fb.at(32), 20, 2, 1), 0, 20);
+    markScrStr(z, tOffsetOrArray(r, z, w, 40, fb.at(40), 20, 2, 1), 0, 20);
+
+    putXStringFromTag(r, z, w, 88, fb.at(88));               // parentWeaponName
+    tFxEffectDefHandle(r, z, w, 152, fb.at(152), fb.slot(152));            // viewFlashEffect
+    tFxEffectDefHandle(r, z, w, 160, fb.at(160), fb.slot(160));            // worldFlashEffect
+
+    // pickupSound .. adsZoomSound: 62 plain strings in field order.
+    for (uint32_t o = 168; o <= 656; o += 8)
+        putXStringFromTag(r, z, w, o, fb.at(o));
+
+    tXStringArrayPtr(r, z, w, 664, fb.at(664), 31);          // bounceSound[31]
+    for (uint32_t o = 672; o <= 688; o += 8)                 // the mounted weapdefs
+        putXStringFromTag(r, z, w, o, fb.at(o));
+
+    for (uint32_t o = 712; o <= 736; o += 8)                 // the four eject effects
+        tFxEffectDefHandle(r, z, w, o, fb.at(o), fb.slot(o));
+    tMaterialHandle(r, z, w, 744, fb.at(744), fb.slot(744));               // reticleCenter
+    tMaterialHandle(r, z, w, 752, fb.at(752), fb.slot(752));               // reticleSide
+
+    tXModelHandleArray(r, z, w, 1120, fb.at(1120), 16);      // worldModel[16]
+    for (uint32_t o = 1128; o <= 1152; o += 8)               // worldClip .. addMelee
+        tXModelHandle(r, z, w, o, fb.at(o), fb.slot(o));
+
+    tMaterialHandle(r, z, w, 1160, fb.at(1160), fb.slot(1160));             // hudIcon
+    tMaterialHandle(r, z, w, 1192, fb.at(1192), fb.slot(1192));             // ammoCounterIcon
+    putXStringFromTag(r, z, w, 1224, fb.at(1224));           // szSharedAmmoCapName
+    markScrStr(z, w, 1268);                                   // explosionTag
+
+    for (uint32_t o = 1304; o <= 1344; o += 8)               // the six spin sounds
+        putXStringFromTag(r, z, w, o, fb.at(o));
+    putXStringFromTag(r, z, w, 1576, fb.at(1576));           // stackSound
+
+    tMaterialHandle(r, z, w, 1816, fb.at(1816), fb.slot(1816));             // killIcon
+    tMaterialHandle(r, z, w, 1176, fb.at(1176), fb.slot(1176));             // indicatorIcon
+    putXStringFromTag(r, z, w, 1840, fb.at(1840));           // szSpawnedGrenadeWeaponName
+    putXStringFromTag(r, z, w, 1848, fb.at(1848));           // szDualWieldWeaponName
+
+    tXModelHandle(r, z, w, 1944, fb.at(1944), fb.slot(1944));               // projectileModel
+    for (uint32_t o = 1960; o <= 2040; o += 16)              // projExplosionEffect 1..5, dud
+        tFxEffectDefHandle(r, z, w, o, fb.at(o), fb.slot(o));
+    for (uint32_t o = 2048; o <= 2072; o += 8)               // the four projectile sounds
+        putXStringFromTag(r, z, w, o, fb.at(o));
+
+    tOffsetOrArray(r, z, w, 2120, fb.at(2120), 31, 4, 3);    // parallelBounce[31]
+    tOffsetOrArray(r, z, w, 2128, fb.at(2128), 31, 4, 3);    // perpendicularBounce[31]
+    tFxEffectDefHandle(r, z, w, 2136, fb.at(2136), fb.slot(2136));          // projTrailEffect
+    tFxEffectDefHandle(r, z, w, 2168, fb.at(2168), fb.slot(2168));          // projIgnitionEffect
+    putXStringFromTag(r, z, w, 2176, fb.at(2176));           // projIgnitionSound
+
+    // Both knot arrays of a graph are sized by accuracyGraphKnotCount[i]; the
+    // originalAccuracyGraphKnotCount fields are not used by the loader.
+    for (uint32_t i = 0; i < 2; ++i) {
+        int32_t knots;
+        memcpy(&knots, z.at(w) + 2384 + i * 4, 4);
+        const uint32_t n = knots > 0 ? (uint32_t)knots : 0;
+        putXStringFromTag(r, z, w, 2336 + i * 8, fb.at(2336 + i * 8));
+        tOffsetOrArray(r, z, w, 2352 + i * 8, fb.at(2352 + i * 8), n * 2, 4, 3);
+        tOffsetOrArray(r, z, w, 2368 + i * 8, fb.at(2368 + i * 8), n * 2, 4, 3);
+    }
+
+    putXStringFromTag(r, z, w, 2472, fb.at(2472));           // szUseHintString
+    putXStringFromTag(r, z, w, 2480, fb.at(2480));           // dropHintString
+    putXStringFromTag(r, z, w, 2504, fb.at(2504));           // szScript
+    tOffsetOrArray(r, z, w, 2544, fb.at(2544), 19, 4, 3);    // locationDamageMultipliers
+    for (uint32_t o = 2552; o <= 2568; o += 8)               // the three rumbles
+        putXStringFromTag(r, z, w, o, fb.at(o));
+    putXStringFromTag(r, z, w, 2608, fb.at(2608));           // flameTableFirstPerson
+    putXStringFromTag(r, z, w, 2616, fb.at(2616));           // flameTableThirdPerson
+    tFlameTable(r, z, w, 2624, fb.at(2624));
+    tFlameTable(r, z, w, 2632, fb.at(2632));
+    tFxEffectDefHandle(r, z, w, 2640, fb.at(2640), fb.slot(2640));          // tagFx_preparationEffect
+    tFxEffectDefHandle(r, z, w, 2648, fb.at(2648), fb.slot(2648));          // tagFlash_preparationEffect
+}
+
+// WeaponVariantDef: 228 -> 288, the asset type 24 payload.
+static void tWeaponVariantDef(Reader &r, Prelink &z, Prelink::Loc obj) {
+    FixedBlock fb = tReadFixed(r, z, obj, X86SZ_WEAPONVARIANTDEF,
+                               kWeaponVariantDefFlat, sizeof kWeaponVariantDefFlat / 12,
+                               kWeaponVariantDefPtrs, sizeof kWeaponVariantDefPtrs / 8);
+
+    putXStringFromTag(r, z, obj, 0, fb.at(0));               // szInternalName
+    tWeaponDef(r, z, obj, 16, fb.at(16));                    // weapDef
+    putXStringFromTag(r, z, obj, 24, fb.at(24));             // szDisplayName
+    putXStringFromTag(r, z, obj, 40, fb.at(40));             // szAltWeaponName
+    tXStringArrayPtr(r, z, obj, 32, fb.at(32), 66);          // szXAnims[66]
+    markScrStr(z, tOffsetOrArray(r, z, obj, 48, fb.at(48), 32, 2, 1), 0, 32);  // hideTags[32]
+    putXStringFromTag(r, z, obj, 96, fb.at(96));             // szAmmoName
+    putXStringFromTag(r, z, obj, 112, fb.at(112));           // szClipName
+    tMaterialHandle(r, z, obj, 184, fb.at(184));             // overlayMaterial
+    tMaterialHandle(r, z, obj, 192, fb.at(192));             // overlayMaterialLowRes
+    tMaterialHandle(r, z, obj, 200, fb.at(200));             // dpadIcon
+}
+
+// ---- impact fx --------------------------------------------------------------
+// FxImpactTable is a name and a fixed table of 21 FxImpactEntry, each of which
+// is nothing but 31 + 4 FxEffectDef handles: 140 -> 280.
+enum { AT_IMPACTFX = 0x1D, SZ_FXIMPACTTABLE = 16, SZ_FXIMPACTENTRY = 280,
+       FXIMPACT_ROWS = 21, FXIMPACT_HANDLES = 35 };
+
+static void tFxImpactTable(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag  = r.u32();
+    uint32_t tableTag = r.u32();
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+    if (tableTag == TAG_NULL) { z.putPtr(obj, 8, Prelink::none()); return; }
+
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)FXIMPACT_ROWS * SZ_FXIMPACTENTRY, 8);
+    b4Reserve(3, FXIMPACT_ROWS * 140, tbl);
+
+    // Load_FxImpactEntryArray reads all 21 entries as one run, then walks them.
+    std::vector<uint32_t> tags((size_t)FXIMPACT_ROWS * FXIMPACT_HANDLES);
+    for (size_t i = 0; i < tags.size(); ++i) tags[i] = r.u32();
+
+    for (int e = 0; e < FXIMPACT_ROWS; ++e) {
+        Prelink::Loc entry{tbl.blk, tbl.off + (uint32_t)e * SZ_FXIMPACTENTRY};
+        for (int h = 0; h < FXIMPACT_HANDLES; ++h)   // nonflesh[31] then flesh[4]
+            tFxEffectDefHandle(r, z, entry, (uint32_t)h * 8,
+                               tags[(size_t)e * FXIMPACT_HANDLES + h]);
+    }
+    z.putPtr(obj, 8, tbl);
+}
+
+// ---- sound driver globals ---------------------------------------------------
+// SndDriverGlobals: 52 -> 104, a name plus six {count, array} pairs. Every
+// element struct (snd_group, snd_curve, snd_pan, snd_snapshot_group,
+// snd_context, snd_master) is pointer-free and keeps its x86 size, so the
+// arrays copy across byte for byte.
+enum { AT_SNDDRIVERGLOBALS = 0x1B, SZ_SNDDRIVERGLOBALS = 104 };
+
+static void tSndDriverGlobals(Reader &r, Prelink &z, Prelink::Loc obj) {
+    struct { uint32_t count, tag, field, elemSize; } arr[6] = {
+        {0, 0, 16, 80},    // groups         snd_group
+        {0, 0, 32, 100},   // curves         snd_curve
+        {0, 0, 48, 60},    // pans           snd_pan
+        {0, 0, 64, 32},    // snapshotGroups snd_snapshot_group
+        {0, 0, 80, 40},    // contexts       snd_context
+        {0, 0, 96, 176},   // masters        snd_master
+    };
+
+    uint32_t nameTag = r.u32();
+    for (int i = 0; i < 6; ++i) { arr[i].count = r.u32(); arr[i].tag = r.u32(); }
+
+    uint8_t *o = z.at(obj);
+    for (int i = 0; i < 6; ++i)
+        memcpy(o + arr[i].field - 8, &arr[i].count, 4);   // count precedes its array
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+    for (int i = 0; i < 6; ++i) {
+        if (arr[i].tag == TAG_NULL) { z.putPtr(obj, arr[i].field, Prelink::none()); continue; }
+        tFlatArray(r, z, obj, arr[i].field, arr[i].count * arr[i].elemSize, 3);
+    }
+}
+
+// ---- font -------------------------------------------------------------------
+// Font_s: 24 -> 40. Glyph is 24 pointer-free bytes and does not widen, so the
+// glyph table is a straight copy; the loader tests it against -1.
+enum { AT_FONT = 0x14, SZ_FONT = 40 };
+
+static void tFont(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag    = r.u32();
+    int32_t  pixelH     = r.i32();
+    int32_t  glyphCount = r.i32();
+    uint32_t matTag     = r.u32();
+    uint32_t glowTag    = r.u32();
+    uint32_t glyphsTag  = r.u32();
+
+    uint8_t *o = z.at(obj);
+    memcpy(o + 8,  &pixelH, 4);
+    memcpy(o + 12, &glyphCount, 4);
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+    tMaterialHandle(r, z, obj, 16, matTag);
+    tMaterialHandle(r, z, obj, 24, glowTag);
+
+    if (glyphsTag == TAG_NULL)        z.putPtr(obj, 32, Prelink::none());
+    else if (glyphsTag != TAG_INLINE) putStructOffsetRef(z, obj, 32, glyphsTag);
+    else tFlatArray(r, z, obj, 32, 24u * (uint32_t)(glyphCount > 0 ? glyphCount : 0), 3);
+}
+
+// ---- ddl --------------------------------------------------------------------
+// ddlRoot_t -> ddlDef_t (a linked list) -> struct and enum tables.
+// Every array loader here reads its whole fixed run before walking it, and none
+// of them tests the pointer against -1: any non-zero value means inline.
+enum { AT_DDL = 0x28, SZ_DDLROOT = 16, SZ_DDLDEF = 48, SZ_DDLSTRUCT = 24,
+       SZ_DDLENUM = 24, SZ_DDLMEMBER = 56 };
+
+static void tDdlMemberArray(Reader &r, Prelink &z, Prelink::Loc sd,
+                            uint32_t field, int32_t count) {
+    if (count <= 0) { z.putPtr(sd, field, Prelink::none()); return; }
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)count * SZ_DDLMEMBER, 8);
+    b4Reserve(3, (uint32_t)count * 48, tbl);
+
+    std::vector<uint32_t> names(count);
+    for (int i = 0; i < count; ++i) {
+        names[i] = r.u32();
+        uint8_t rest[44];                  // size .. permission
+        r.bytes(rest, 44);
+        memcpy(z.at(Prelink::Loc{tbl.blk, tbl.off + (uint32_t)i * SZ_DDLMEMBER}) + 8,
+               rest, 44);
+    }
+    for (int i = 0; i < count; ++i)
+        putXStringFromTag(r, z, Prelink::Loc{tbl.blk, tbl.off + (uint32_t)i * SZ_DDLMEMBER},
+                          0, names[i]);
+    z.putPtr(sd, field, tbl);
+}
+
+static void tDdlStructArray(Reader &r, Prelink &z, Prelink::Loc dd,
+                            uint32_t field, int32_t count) {
+    if (count <= 0) { z.putPtr(dd, field, Prelink::none()); return; }
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)count * SZ_DDLSTRUCT, 8);
+    b4Reserve(3, (uint32_t)count * 16, tbl);
+
+    std::vector<uint32_t> names(count), memberTags(count);
+    std::vector<int32_t>  memberCounts(count);
+    for (int i = 0; i < count; ++i) {
+        names[i] = r.u32();
+        int32_t size = r.i32();
+        memberCounts[i] = r.i32();
+        memberTags[i] = r.u32();
+        uint8_t *d = z.at(Prelink::Loc{tbl.blk, tbl.off + (uint32_t)i * SZ_DDLSTRUCT});
+        memcpy(d + 8, &size, 4);
+        memcpy(d + 12, &memberCounts[i], 4);
+    }
+    for (int i = 0; i < count; ++i) {
+        Prelink::Loc sd{tbl.blk, tbl.off + (uint32_t)i * SZ_DDLSTRUCT};
+        putXStringFromTag(r, z, sd, 0, names[i]);
+        if (memberTags[i] != TAG_NULL) tDdlMemberArray(r, z, sd, 16, memberCounts[i]);
+        else                           z.putPtr(sd, 16, Prelink::none());
+    }
+    z.putPtr(dd, field, tbl);
+}
+
+static void tDdlEnumArray(Reader &r, Prelink &z, Prelink::Loc dd,
+                          uint32_t field, int32_t count) {
+    if (count <= 0) { z.putPtr(dd, field, Prelink::none()); return; }
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)count * SZ_DDLENUM, 8);
+    b4Reserve(3, (uint32_t)count * 12, tbl);
+
+    std::vector<uint32_t> names(count), memberTags(count);
+    std::vector<int32_t>  memberCounts(count);
+    for (int i = 0; i < count; ++i) {
+        names[i] = r.u32();
+        memberCounts[i] = r.i32();
+        memberTags[i] = r.u32();
+        memcpy(z.at(Prelink::Loc{tbl.blk, tbl.off + (uint32_t)i * SZ_DDLENUM}) + 8,
+               &memberCounts[i], 4);
+    }
+    for (int i = 0; i < count; ++i) {
+        Prelink::Loc ed{tbl.blk, tbl.off + (uint32_t)i * SZ_DDLENUM};
+        putXStringFromTag(r, z, ed, 0, names[i]);
+        if (memberTags[i] == TAG_NULL || memberCounts[i] <= 0) {
+            z.putPtr(ed, 16, Prelink::none());
+            continue;
+        }
+        Prelink::Loc strs = z.alloc(OUT, (size_t)memberCounts[i] * 8, 8);
+        b4Reserve(3, (uint32_t)memberCounts[i] * 4, strs);
+        std::vector<uint32_t> tags(memberCounts[i]);
+        for (int k = 0; k < memberCounts[i]; ++k) tags[k] = r.u32();
+        for (int k = 0; k < memberCounts[i]; ++k)
+            putXStringFromTag(r, z, strs, (uint32_t)k * 8, tags[k]);
+        z.putPtr(ed, 16, strs);
+    }
+    z.putPtr(dd, field, tbl);
+}
+
+// ddlDef_t: 28 -> 48, chained through `next`. Load_ddlDefNext re-reads the
+// 28-byte block for each link, so the recursion mirrors the loader exactly.
+static void tDdlDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc dd = z.alloc(OUT, SZ_DDLDEF, 8);
+    b4Reserve(3, 28, dd);
+
+    int32_t  version     = r.i32();
+    int32_t  size        = r.i32();
+    uint32_t structTag   = r.u32();
+    int32_t  structCount = r.i32();
+    uint32_t enumTag     = r.u32();
+    int32_t  enumCount   = r.i32();
+    uint32_t nextTag     = r.u32();
+
+    uint8_t *o = z.at(dd);
+    memcpy(o,      &version, 4);
+    memcpy(o + 4,  &size, 4);
+    memcpy(o + 16, &structCount, 4);
+    memcpy(o + 32, &enumCount, 4);
+
+    z.putPtr(obj, field, dd);
+
+    if (structTag != TAG_NULL) tDdlStructArray(r, z, dd, 8, structCount);
+    else                       z.putPtr(dd, 8, Prelink::none());
+    if (enumTag != TAG_NULL)   tDdlEnumArray(r, z, dd, 24, enumCount);
+    else                       z.putPtr(dd, 24, Prelink::none());
+    if (nextTag != TAG_NULL)   tDdlDef(r, z, dd, 40);
+    else                       z.putPtr(dd, 40, Prelink::none());
+}
+
+static void tDdlRoot(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag = r.u32();
+    uint32_t defTag  = r.u32();
+    putXStringFromTag(r, z, obj, 0, nameTag);
+    if (defTag != TAG_NULL) tDdlDef(r, z, obj, 8);
+    else                    z.putPtr(obj, 8, Prelink::none());
+}
+
+// ---- sound ------------------------------------------------------------------
+// SndBank -> snd_alias_list_t[] -> snd_alias_t[] -> SoundFile -> loaded or
+// streamed sound. snd_radverb, snd_snapshot and SndIndexEntry are pointer-free
+// and keep their x86 sizes.
+//
+// The PCM payloads are the one place the game leaves block 4: Load_snd_asset
+// wraps them in DB_PushStreamPos(5)/(6) and allocates with
+// AllocLoad_snd_align_char == DB_AllocStreamPos(2047). They go into their own
+// output block here, and the block-4 cursor is deliberately left alone.
+// NOTE: nx_kbz.cpp allocates every block with plain malloc, so the 2048-byte
+// alignment the game gives these buffers is not reproduced on device.
+enum { AT_SOUND = 9, SNDBLK = 5,
+       SZ_SNDBANK = 72, SZ_SNDALIASLIST = 32, SZ_SNDALIAS = 104,
+       SZ_SOUNDFILE = 16, SZ_LOADEDSOUND = 80, SZ_SNDASSET = 72,
+       SZ_PRIMEDSOUND = 24, SZ_STREAMEDSOUND = 16 };
+
+// A 2048-aligned PCM payload in the sound block. No b4Reserve: the game
+// allocates these from blocks 5 and 6, not from block 4.
+static void tSndPayload(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                        uint32_t nbytes) {
+    Prelink::Loc b = z.alloc(SNDBLK, nbytes ? nbytes : 1, 2048);
+    if (nbytes) r.bytes(z.at(b), nbytes);
+    z.putPtr(obj, field, b);
+}
+
+// snd_asset sits inline inside LoadedSound; its 56-byte block has already been
+// read by the caller, so only seek_table and data follow.
+static Prelink::Loc tSndAsset(Reader &r, Prelink &z, Prelink::Loc ls, uint32_t base,
+                      uint32_t seekTag, uint32_t seekCount,
+                      uint32_t dataTag, uint32_t dataSize) {
+    Prelink::Loc seek = Prelink::none();
+    if (seekTag != TAG_NULL)
+        seek = tSimpleArray(r, z, ls, base + 48, seekTag, seekCount, 4, 3);
+    else
+        z.putPtr(ls, base + 48, Prelink::none());
+
+    if (dataTag != TAG_NULL) tSndPayload(r, z, ls, base + 64, dataSize);
+    else                     z.putPtr(ls, base + 64, Prelink::none());
+    return seek;
+}
+
+// Loaded sounds by snd_asset_format (0 PCM16 .. 6 MS-ADPCM, 7 WMA): count and
+// payload bytes, printed with the zone summary.
+static unsigned g_sndFormatCount[8];
+static uint64_t g_sndFormatBytes[8];
+
+// LoadedSound: 60 -> 80, a name followed by an inline snd_asset (56 -> 72).
+static void tLoadedSound(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc ls = z.alloc(OUT, SZ_LOADEDSOUND, 8);
+    b4Reserve(3, 60, ls);
+
+    uint32_t nameTag = r.u32();
+    uint8_t  head[44];                     // version .. seek_table_count
+    r.bytes(head, 44);
+    uint32_t seekTag  = r.u32();
+    uint32_t dataSize = r.u32();
+    uint32_t dataTag  = r.u32();
+
+    uint8_t *o = z.at(ls);
+    memcpy(o + 8,  head, 44);              // snd_asset starts at LP64 offset 8
+    memcpy(o + 64, &dataSize, 4);          // 8 + snd_asset.data_size@56
+
+    uint32_t seekCount;
+    memcpy(&seekCount, head + 40, 4);
+    uint32_t format;
+    memcpy(&format, head + 28, 4);
+    if (format < 8) {
+        ++g_sndFormatCount[format];
+        g_sndFormatBytes[format] += dataSize;
+    }
+
+    z.putPtr(obj, field, ls);
+    std::string name;
+    if (nameTag == TAG_INLINE) {
+        name = r.cstr();
+        z.putPtr(ls, 0, emitInlineStr(z, name));
+    } else {
+        putXStringFromTag(r, z, ls, 0, nameTag);
+    }
+    Prelink::Loc seek = tSndAsset(r, z, ls, 8, seekTag, seekCount, dataTag, dataSize);
+    // FFCONV_SNDDUMP=1: every loaded sound's header, to check lengths and rates,
+    // and for WMA the seek table (decoded bytes after each packet).
+    if (getenv("FFCONV_SNDDUMP")) {
+        uint32_t h[11];
+        memcpy(h, head, 44);
+        printf("  snd '%s': ver %u frames %u rate %u ch %u hdr %u block %u buf %u fmt %u chflags %u flags %u seek %u data %u",
+               name.c_str(), h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], dataSize);
+        if (seek.valid() && seekCount) {
+            const uint32_t *t = (const uint32_t *)z.at(seek);
+            printf(" | seek[0] %u seek[last] %u", t[0], t[seekCount - 1]);
+            if (getenv("FFCONV_SNDDUMP_SEEK")) {
+                printf(" | deltas");
+                for (uint32_t i = 1; i < seekCount && i < 24; ++i)
+                    printf(" %u", t[i] - t[i - 1]);
+            }
+        }
+        printf("\n");
+    }
+}
+
+// PrimedSound: 12 -> 24. buffer is another 2048-aligned payload.
+static void tPrimedSound(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc ps = z.alloc(OUT, SZ_PRIMEDSOUND, 8);
+    b4Reserve(3, 12, ps);
+
+    uint32_t nameTag = r.u32();
+    uint32_t bufTag  = r.u32();
+    uint32_t size    = r.u32();
+
+    memcpy(z.at(ps) + 16, &size, 4);
+    z.putPtr(obj, field, ps);
+
+    putXStringFromTag(r, z, ps, 0, nameTag);
+    if (bufTag != TAG_NULL) tSndPayload(r, z, ps, 8, size);
+    else                    z.putPtr(ps, 8, Prelink::none());
+}
+
+// StreamedSound: 8 -> 16. primeSnd is one of the pointers that tests -1.
+static void tStreamedSound(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc ss = z.alloc(OUT, SZ_STREAMEDSOUND, 8);
+    b4Reserve(3, 8, ss);
+
+    uint32_t fileTag  = r.u32();
+    uint32_t primeTag = r.u32();
+
+    z.putPtr(obj, field, ss);
+    putXStringFromTag(r, z, ss, 0, fileTag);
+
+    if (primeTag == TAG_NULL)        z.putPtr(ss, 8, Prelink::none());
+    else if (primeTag != TAG_INLINE) putStructOffsetRef(z, ss, 8, primeTag);
+    else                             tPrimedSound(r, z, ss, 8);
+}
+
+// The union half of a SoundFile, walked once its 8-byte record is in place:
+// a LoadedSound when type == 1 and a StreamedSound otherwise
+// (Load_SoundFileRef, db_load.cpp:1424).
+static void tSoundFileRef(Reader &r, Prelink &z, Prelink::Loc sf, uint32_t uTag, uint8_t type) {
+    if (uTag == TAG_NULL)        { z.putPtr(sf, 0, Prelink::none()); return; }
+    if (uTag != TAG_INLINE)      { putStructOffsetRef(z, sf, 0, uTag); return; }
+    if (type == 1)               tLoadedSound(r, z, sf, 0);
+    else                         tStreamedSound(r, z, sf, 0);
+}
+
+// SoundFile: 8 -> 16.
+static void tSoundFile(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field) {
+    Prelink::Loc sf = z.alloc(OUT, SZ_SOUNDFILE, 8);
+    b4Reserve(3, 8, sf);
+
+    uint32_t uTag = r.u32();
+    uint8_t  tail[4] = {0};                      // type, exists, padding
+    r.bytes(tail, 4);
+    memcpy(z.at(sf) + 8, tail, 4);
+
+    z.putPtr(obj, field, sf);
+    tSoundFileRef(r, z, sf, uTag, tail[0]);
+}
+
+// The alias list being read, for FFCONV_ALIASDUMP.
+static std::string g_curAliasList;
+
+// snd_alias_t: 84 -> 104. Load_snd_alias_tArray reads the whole 84*count run
+// before walking it.
+static void tSndAliasArray(Reader &r, Prelink &z, Prelink::Loc list,
+                           uint32_t field, int32_t count) {
+    if (count <= 0) { z.putPtr(list, field, Prelink::none()); return; }
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)count * SZ_SNDALIAS, 8);
+    b4Reserve(3, (uint32_t)count * 84, tbl);
+
+    struct AliasTags { uint32_t name, subtitle, secondary, soundFile; };
+    std::vector<AliasTags> at(count);
+    for (int i = 0; i < count; ++i) {
+        Prelink::Loc a{tbl.blk, tbl.off + (uint32_t)i * SZ_SNDALIAS};
+        at[i].name = r.u32();
+        uint32_t id = r.u32();
+        at[i].subtitle  = r.u32();
+        at[i].secondary = r.u32();
+        at[i].soundFile = r.u32();
+        uint8_t rest[64];                  // flags .. snapshotGroup, plus padding
+        r.bytes(rest, 64);
+        uint8_t *d = z.at(a);
+        memcpy(d + 8,  &id, 4);
+        memcpy(d + 40, rest, 63);          // the 64th byte is x86 tail padding
+    }
+    for (int i = 0; i < count; ++i) {
+        Prelink::Loc a{tbl.blk, tbl.off + (uint32_t)i * SZ_SNDALIAS};
+        // FFCONV_ALIASDUMP=<substring>: the limit and distance fields of the
+        // aliases whose list name contains it (an alias's own name is usually
+        // a reference to its list's).
+        putXStringFromTag(r, z, a, 0,  at[i].name);
+        if (getenv("FFCONV_ALIASDUMP") && strstr(g_curAliasList.c_str(), getenv("FFCONV_ALIASDUMP"))) {
+            const std::string &nm = g_curAliasList;
+            {
+                const uint8_t *d = z.at(a);
+                uint32_t flags; memcpy(&flags, d + 40, 4);
+                uint16_t u[16]; memcpy(u, d + 56, 32);   // fluxTime .. envelopPercentage
+                const uint8_t *b = d + 88;               // minPriorityThreshold ..
+                printf("  alias '%s' #%d: flags %08x loop %u limitType %u limit %u entLimitType %u entLimit %u "
+                       "startDelay %u distMin %u distMax %u vol %u-%u pitch %u-%u probability %u\n",
+                       nm.c_str(), i, flags, flags & 1, (flags >> 25) & 3, b[12], (flags >> 27) & 3, b[13],
+                       u[1], u[10], u[11], u[4], u[5], u[7], u[8], b[2]);
+            }
+        }
+        putXStringFromTag(r, z, a, 16, at[i].subtitle);
+        putXStringFromTag(r, z, a, 24, at[i].secondary);
+        if (at[i].soundFile == TAG_NULL)        z.putPtr(a, 32, Prelink::none());
+        else if (at[i].soundFile != TAG_INLINE) putStructOffsetRef(z, a, 32, at[i].soundFile);
+        else                                    tSoundFile(r, z, a, 32);
+    }
+    z.putPtr(list, field, tbl);
+}
+
+// snd_alias_list_t: 20 -> 32.
+static void tSndAliasListArray(Reader &r, Prelink &z, Prelink::Loc bank,
+                               uint32_t field, int32_t count) {
+    if (count <= 0) { z.putPtr(bank, field, Prelink::none()); return; }
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)count * SZ_SNDALIASLIST, 8);
+    b4Reserve(3, (uint32_t)count * 20, tbl);
+
+    std::vector<uint32_t> names(count), heads(count);
+    std::vector<int32_t>  counts(count);
+    for (int i = 0; i < count; ++i) {
+        names[i] = r.u32();
+        uint32_t id = r.u32();
+        heads[i] = r.u32();
+        counts[i] = r.i32();
+        int32_t sequence = r.i32();
+        uint8_t *d = z.at(Prelink::Loc{tbl.blk, tbl.off + (uint32_t)i * SZ_SNDALIASLIST});
+        memcpy(d + 8,  &id, 4);
+        memcpy(d + 24, &counts[i], 4);
+        memcpy(d + 28, &sequence, 4);
+    }
+    for (int i = 0; i < count; ++i) {
+        Prelink::Loc l{tbl.blk, tbl.off + (uint32_t)i * SZ_SNDALIASLIST};
+        if (names[i] == TAG_INLINE) {
+            g_curAliasList = r.cstr();
+            z.putPtr(l, 0, emitInlineStr(z, g_curAliasList));
+        } else {
+            g_curAliasList.clear();
+            putXStringFromTag(r, z, l, 0, names[i]);
+        }
+        if (heads[i] == TAG_NULL)        z.putPtr(l, 16, Prelink::none());
+        else if (heads[i] != TAG_INLINE) putStructOffsetRef(z, l, 16, heads[i]);
+        else                             tSndAliasArray(r, z, l, 16, counts[i]);
+    }
+    z.putPtr(bank, field, tbl);
+}
+
+// SndBank: 40 -> 72.
+static void tSndBank(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag       = r.u32();
+    int32_t  aliasCount    = r.i32();
+    uint32_t aliasTag      = r.u32();
+    uint32_t aliasIndexTag = r.u32();
+    uint32_t packHash      = r.u32();
+    uint32_t packLocation  = r.u32();
+    int32_t  radverbCount  = r.i32();
+    uint32_t radverbTag    = r.u32();
+    int32_t  snapshotCount = r.i32();
+    uint32_t snapshotTag   = r.u32();
+
+    uint8_t *o = z.at(obj);
+    memcpy(o + 8,  &aliasCount, 4);
+    memcpy(o + 32, &packHash, 4);
+    memcpy(o + 36, &packLocation, 4);
+    memcpy(o + 40, &radverbCount, 4);
+    memcpy(o + 56, &snapshotCount, 4);
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+
+    if (aliasTag != TAG_NULL) tSndAliasListArray(r, z, obj, 16, aliasCount);
+    else                      z.putPtr(obj, 16, Prelink::none());
+
+    // aliasIndex is SndIndexEntry[aliasCount], 4 pointer-free bytes each.
+    if (aliasIndexTag != TAG_NULL)
+        tFlatArray(r, z, obj, 24, 4u * (uint32_t)(aliasCount > 0 ? aliasCount : 0), 3);
+    else
+        z.putPtr(obj, 24, Prelink::none());
+
+    if (radverbTag != TAG_NULL)          // snd_radverb, 96 flat bytes
+        tFlatArray(r, z, obj, 48, 96u * (uint32_t)(radverbCount > 0 ? radverbCount : 0), 3);
+    else
+        z.putPtr(obj, 48, Prelink::none());
+
+    if (snapshotTag != TAG_NULL)         // snd_snapshot, 348 flat bytes
+        tFlatArray(r, z, obj, 64, 348u * (uint32_t)(snapshotCount > 0 ? snapshotCount : 0), 3);
+    else
+        z.putPtr(obj, 64, Prelink::none());
+}
+
+// SndPatch: 20 -> 40, measured with aarch64-none-elf-g++ against snd_bank.h
+// (name@0, elementCount@8, elements@16, fileCount@24, files@32).
+// Load_SndPatch (db_load.cpp:1622): the 20-byte block, then under
+// DB_PushStreamPos(4) the name, the elements, the files.
+//  - elements is tested against zero only: any non-zero value means a
+//    uint[elementCount] follows, AllocLoad_FxElemVisStateSample (align 4).
+//  - files tests -1: inline SoundFile[fileCount], same allocator; any other
+//    non-zero value is a DB_ConvertOffsetToPointer reference.
+enum { AT_SOUND_PATCH = 10, SZ_SNDPATCH = 40 };
+
+// Load_SoundFileArray (db_load.cpp:1464): every 8-byte record first, then each
+// element's union. An offset reference may name any element, not only the
+// first, so each element's x86 offset is mapped to its LP64 location.
+static void tSoundFileArray(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                            uint32_t count) {
+    Prelink::Loc arr = z.alloc(OUT, count ? (size_t)count * SZ_SOUNDFILE : 1, 8);
+    const uint32_t x86 = b4Reserve(3, count * 8, arr);
+
+    std::vector<uint32_t> uTags(count);
+    std::vector<uint8_t>  types(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        const Prelink::Loc sf{arr.blk, arr.off + i * SZ_SOUNDFILE};
+        uTags[i] = r.u32();
+        uint8_t tail[4] = {0};                   // type, exists, padding
+        r.bytes(tail, 4);
+        memcpy(z.at(sf) + 8, tail, 4);
+        types[i] = tail[0];
+        g_b4map[x86 + i * 8] = sf;
+    }
+    z.putPtr(obj, field, arr);
+    for (uint32_t i = 0; i < count; ++i)
+        tSoundFileRef(r, z, Prelink::Loc{arr.blk, arr.off + i * SZ_SOUNDFILE}, uTags[i], types[i]);
+}
+
+static void tSndPatch(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag      = r.u32();
+    uint32_t elementCount = r.u32();
+    uint32_t elementsTag  = r.u32();
+    uint32_t fileCount    = r.u32();
+    uint32_t filesTag     = r.u32();
+
+    uint8_t *o = z.at(obj);
+    memcpy(o + 8,  &elementCount, 4);
+    memcpy(o + 24, &fileCount, 4);
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+
+    // FFDBG: how many field writes each sound table receives, walked the way
+    // SND_PatchApply (snd_bank.cpp:585) walks elements[]. Table 0 is
+    // snd_alias_t, whose SND_ALIAS_FIELDS offsets are x86.
+    if (getenv("FFDBG") && elementsTag != TAG_NULL) {
+        std::vector<uint32_t> e(elementCount);
+        memcpy(e.data(), r.p, (size_t)elementCount * 4);
+        uint32_t perTable[9] = {0}, rows[9] = {0};
+        for (uint32_t i = 0; i + 1 < elementCount; ) {
+            uint32_t table = e[i] >> 16, fields = e[i] & 0xFFFF;
+            i += 2;
+            if (table < 9) { ++rows[table]; perTable[table] += fields; }
+            i += fields;
+        }
+        fprintf(stderr, "  SndPatch elements=%u files=%u  rows/fields per table:",
+                elementCount, fileCount);
+        for (int t = 0; t < 9; ++t)
+            if (rows[t]) fprintf(stderr, " t%d=%u/%u", t, rows[t], perTable[t]);
+        fprintf(stderr, "\n");
+    }
+
+    tSimpleArray(r, z, obj, 16, elementsTag, elementCount, 4, 3);
+
+    if (filesTag == TAG_NULL)        z.putPtr(obj, 32, Prelink::none());
+    else if (filesTag != TAG_INLINE) putStructOffsetRef(z, obj, 32, filesTag);
+    else                             tSoundFileArray(r, z, obj, 32, fileCount);
+}
+
+// ---- emblems ----------------------------------------------------------------
+// EmblemSet -> layers / categories / icons / backgrounds / backgroundLookup.
+// Load_EmblemSet (db_load.cpp:7211) reads the 44-byte block, then the five
+// arrays in that order. Every array loader reads all its fixed records as one
+// Load_Stream before walking them.
+
+enum { AT_EMBLEMSET = 42, SZ_EMBLEMSET = 80,
+       SZ_EMBLEMCATEGORY = 16, SZ_EMBLEMICON = 48, SZ_EMBLEMBACKGROUND = 32 };
+
+// Load_GfxImagePtr (db_load.cpp:1978): like Load_MaterialHandle, -1 and -2
+// both mean an inline GfxImage follows; any other non-zero value is an alias.
+static void tGfxImagePtr(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                         uint32_t tag, uint32_t x86slot = 0) {
+    if (tag == TAG_INLINE || tag == TAG_ALIAS) {
+        Prelink::Loc im = z.alloc(OUT, SZ_IMAGE, 8);
+        tempReserve(52);       // Load_GfxImagePtr -> block 0
+        if (tag == TAG_ALIAS) g_aliasMap[insertPointerSlot()] = im;
+        noteAliasSlot(x86slot, im);
+        tGfxImage(r, z, im);
+        z.addAsset(AT_IMAGE, im);           // Load_GfxImageAsset, db_load.cpp:1997
+        z.putPtr(obj, field, im);
+    } else if (tag != TAG_NULL) {
+        noteAliasSlot(x86slot, putAssetHandleRef(z, obj, field, tag));
+    } else {
+        z.putPtr(obj, field, Prelink::none());
+    }
+}
+
+// EmblemCategory: 8 -> 16, two strings.
+static void tEmblemCategoryArray(Reader &r, Prelink &z, Prelink::Loc obj,
+                                 uint32_t field, int32_t count) {
+    Prelink::Loc tbl = z.alloc(OUT, count ? (size_t)count * SZ_EMBLEMCATEGORY : 1, 8);
+    b4Reserve(3, (uint32_t)count * 8, tbl);
+
+    std::vector<uint32_t> nameTag(count), descTag(count);
+    for (int i = 0; i < count; ++i) { nameTag[i] = r.u32(); descTag[i] = r.u32(); }
+    for (int i = 0; i < count; ++i) {
+        Prelink::Loc c{tbl.blk, tbl.off + (uint32_t)i * SZ_EMBLEMCATEGORY};
+        putXStringFromTag(r, z, c, 0, nameTag[i]);
+        putXStringFromTag(r, z, c, 8, descTag[i]);
+    }
+    z.putPtr(obj, field, tbl);
+}
+
+// EmblemIcon: 40 -> 48. An image handle, a string, and eight scalars.
+static void tEmblemIconArray(Reader &r, Prelink &z, Prelink::Loc obj,
+                             uint32_t field, int32_t count) {
+    Prelink::Loc tbl = z.alloc(OUT, count ? (size_t)count * SZ_EMBLEMICON : 1, 8);
+    b4Reserve(3, (uint32_t)count * 40, tbl);
+
+    std::vector<uint32_t> imgTag(count), descTag(count);
+    for (int i = 0; i < count; ++i) {
+        imgTag[i]  = r.u32();
+        descTag[i] = r.u32();
+        uint8_t scalars[32] = {0};     // outlineSize .. category
+        r.bytes(scalars, 32);
+        memcpy(z.at(Prelink::Loc{tbl.blk, tbl.off + (uint32_t)i * SZ_EMBLEMICON}) + 16,
+               scalars, 32);
+    }
+    for (int i = 0; i < count; ++i) {
+        Prelink::Loc c{tbl.blk, tbl.off + (uint32_t)i * SZ_EMBLEMICON};
+        tGfxImagePtr(r, z, c, 0, imgTag[i]);
+        putXStringFromTag(r, z, c, 8, descTag[i]);
+    }
+    z.putPtr(obj, field, tbl);
+}
+
+// EmblemBackground: 24 -> 32. A material handle, a string, four ints.
+static void tEmblemBackgroundArray(Reader &r, Prelink &z, Prelink::Loc obj,
+                                   uint32_t field, int32_t count) {
+    Prelink::Loc tbl = z.alloc(OUT, count ? (size_t)count * SZ_EMBLEMBACKGROUND : 1, 8);
+    b4Reserve(3, (uint32_t)count * 24, tbl);
+
+    std::vector<uint32_t> matTag(count), descTag(count);
+    for (int i = 0; i < count; ++i) {
+        matTag[i]  = r.u32();
+        descTag[i] = r.u32();
+        uint8_t scalars[16] = {0};     // cost, unlockLevel, unlockPLevel, unclassifyAt
+        r.bytes(scalars, 16);
+        memcpy(z.at(Prelink::Loc{tbl.blk, tbl.off + (uint32_t)i * SZ_EMBLEMBACKGROUND}) + 16,
+               scalars, 16);
+    }
+    for (int i = 0; i < count; ++i) {
+        Prelink::Loc c{tbl.blk, tbl.off + (uint32_t)i * SZ_EMBLEMBACKGROUND};
+        tMaterialHandle(r, z, c, 0, matTag[i]);
+        putXStringFromTag(r, z, c, 8, descTag[i]);
+    }
+    z.putPtr(obj, field, tbl);
+}
+
+// EmblemSet: 44 -> 80. Each of the five pointers is tested only against zero.
+static void tEmblemSet(Reader &r, Prelink &z, Prelink::Loc obj) {
+    int32_t  colorCount   = r.i32();
+    int32_t  layerCount   = r.i32();
+    uint32_t layersTag    = r.u32();
+    int32_t  catCount     = r.i32();
+    uint32_t catsTag      = r.u32();
+    int32_t  iconCount    = r.i32();
+    uint32_t iconsTag     = r.u32();
+    int32_t  bgCount      = r.i32();
+    uint32_t bgsTag       = r.u32();
+    int32_t  lookupCount  = r.i32();
+    uint32_t lookupTag    = r.u32();
+
+    uint8_t *o = z.at(obj);
+    memcpy(o,      &colorCount, 4);
+    memcpy(o + 4,  &layerCount, 4);
+    memcpy(o + 16, &catCount, 4);
+    memcpy(o + 32, &iconCount, 4);
+    memcpy(o + 48, &bgCount, 4);
+    memcpy(o + 64, &lookupCount, 4);
+
+    // EmblemLayer is three ints, so the array copies across byte for byte.
+    if (layersTag != TAG_NULL)
+        tFlatArray(r, z, obj, 8, 12u * (uint32_t)(layerCount > 0 ? layerCount : 0), 3);
+    else
+        z.putPtr(obj, 8, Prelink::none());
+
+    if (catsTag != TAG_NULL)
+        tEmblemCategoryArray(r, z, obj, 24, catCount > 0 ? catCount : 0);
+    else
+        z.putPtr(obj, 24, Prelink::none());
+
+    if (iconsTag != TAG_NULL)
+        tEmblemIconArray(r, z, obj, 40, iconCount > 0 ? iconCount : 0);
+    else
+        z.putPtr(obj, 40, Prelink::none());
+
+    if (bgsTag != TAG_NULL)
+        tEmblemBackgroundArray(r, z, obj, 56, bgCount > 0 ? bgCount : 0);
+    else
+        z.putPtr(obj, 56, Prelink::none());
+
+    if (lookupTag != TAG_NULL) {       // AllocLoad_XBlendInfo -> align 2
+        uint32_t n = 2u * (uint32_t)(lookupCount > 0 ? lookupCount : 0);
+        Prelink::Loc b = z.alloc(OUT, n ? n : 1, 2);
+        if (n) r.bytes(z.at(b), n);
+        b4Reserve(1, n, b);
+        z.putPtr(obj, 72, b);
+    } else {
+        z.putPtr(obj, 72, Prelink::none());
+    }
+}
+
+// ---- map assets -------------------------------------------------------------
+// LP64 sizes and offsets from here on are the layout oracle's
+// (tools/ffconv/layout: layout.sh prints what the Switch compiler lays out).
+
+// Load_PhysPresetPtr / Load_PhysConstraintsPtr (db_load.cpp:2826/2905), for
+// callers other than XModel, which inlines the same thing.
+static void tPhysPresetHandle(Reader &r, Prelink &z, Prelink::Loc obj,
+                              uint32_t field, uint32_t tag, uint32_t x86slot = 0) {
+    if (tag == TAG_INLINE || tag == TAG_ALIAS) {
+        Prelink::Loc p = z.alloc(OUT, SZ_PHYSPRESET, 8);
+        tempReserve(84);
+        if (tag == TAG_ALIAS) g_aliasMap[insertPointerSlot()] = p;
+        noteAliasSlot(x86slot, p);
+        tPhysPreset(r, z, p);
+        z.addAsset(AT_PHYSPRESET, p);
+        z.putPtr(obj, field, p);
+    } else if (tag != TAG_NULL) {
+        noteAliasSlot(x86slot, putAssetHandleRef(z, obj, field, tag));
+    }
+}
+
+static void tPhysConstraintsHandle(Reader &r, Prelink &z, Prelink::Loc obj,
+                                   uint32_t field, uint32_t tag, uint32_t x86slot = 0) {
+    if (tag == TAG_INLINE || tag == TAG_ALIAS) {
+        Prelink::Loc p = z.alloc(OUT, SZ_PHYSCONSTRAINTS, 8);
+        tempReserve(2696);
+        if (tag == TAG_ALIAS) g_aliasMap[insertPointerSlot()] = p;
+        noteAliasSlot(x86slot, p);
+        tPhysConstraints(r, z, p);
+        z.addAsset(AT_PHYSCONSTRAINTS, p);
+        z.putPtr(obj, field, p);
+    } else if (tag != TAG_NULL) {
+        noteAliasSlot(x86slot, putAssetHandleRef(z, obj, field, tag));
+    }
+}
+
+// DestructibleDef: 24 -> 48, pieces[] 312 -> 496, stages[5] 48 -> 80.
+// Load_DestructibleDef (db_load.cpp:6307): name, model, pristineModel, then the
+// whole pieces[] block, then each piece's references -- its five stages' first,
+// stage by stage, then the piece's own.
+enum { AT_DESTRUCTIBLEDEF = 3, SZ_DESTRUCTIBLEDEF = 48, SZ_DPIECE = 496, SZ_DSTAGE = 80 };
+
+struct DStageTags { uint32_t fx, snd, notify, loop, model[3], preset; };
+struct DPieceTags { DStageTags stage[5]; uint32_t constraints, damageSnd, burnFx, burnSnd; };
+
+static void tDestructibleStageFixed(Reader &r, uint8_t *o, DStageTags &t) {
+    r.bytes(o, 16);                     // showBone, pad, breakHealth, maxTime, flags
+    t.fx = r.u32();
+    t.snd = r.u32();
+    t.notify = r.u32();
+    t.loop = r.u32();
+    for (int k = 0; k < 3; ++k) t.model[k] = r.u32();
+    t.preset = r.u32();
+}
+
+static void tDestructibleDef(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag = r.u32(), modelTag = r.u32(), pristineTag = r.u32();
+    int32_t  numPieces = r.i32();
+    uint32_t piecesTag = r.u32();
+    int32_t  clientOnly = r.i32();
+    z.putI32(obj, 24, numPieces);
+    z.putI32(obj, 40, clientOnly);
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+    tXModelHandle(r, z, obj, 8, modelTag);
+    tXModelHandle(r, z, obj, 16, pristineTag);
+    if (piecesTag == TAG_NULL || numPieces <= 0) return;
+
+    const uint32_t n = (uint32_t)numPieces;
+    Prelink::Loc tbl = z.alloc(OUT, (size_t)n * SZ_DPIECE, 8);
+    const uint32_t x86 = b4Reserve(3, n * 312, tbl);
+    z.putPtr(obj, 32, tbl);
+
+    std::vector<DPieceTags> tags(n);
+    for (uint32_t p = 0; p < n; ++p) {
+        uint8_t *o = z.at(tbl) + p * SZ_DPIECE;
+        for (int s = 0; s < 5; ++s)
+            tDestructibleStageFixed(r, o + s * SZ_DSTAGE, tags[p].stage[s]);
+        r.bytes(o + 400, 28);           // parentPiece .. entityDamageTransfer
+        tags[p].constraints = r.u32();
+        r.bytes(o + 440, 4);            // health
+        tags[p].damageSnd = r.u32();
+        tags[p].burnFx = r.u32();
+        tags[p].burnSnd = r.u32();
+        r.bytes(o + 472, 24);           // enableLabel, pad, hideBones[5]
+    }
+
+    for (uint32_t p = 0; p < n; ++p) {
+        Prelink::Loc pc{tbl.blk, tbl.off + p * SZ_DPIECE};
+        const uint32_t px86 = x86 + p * 312;
+        markScrStr(z, pc, L_DestructiblePiece__enableLabel);
+        for (int s = 0; s < 5; ++s) {
+            const DStageTags &t = tags[p].stage[s];
+            Prelink::Loc st{pc.blk, pc.off + (uint32_t)s * SZ_DSTAGE};
+            const uint32_t sx86 = px86 + (uint32_t)s * 48;
+            markScrStr(z, st, L_DestructibleStage__showBone);
+            tFxEffectDefHandle(r, z, st, 16, t.fx, sx86 + 16);
+            putXStringFromTag(r, z, st, 24, t.snd);
+            putXStringFromTag(r, z, st, 32, t.notify);
+            putXStringFromTag(r, z, st, 40, t.loop);
+            for (int k = 0; k < 3; ++k)
+                tXModelHandle(r, z, st, 48 + 8 * k, t.model[k], sx86 + 32 + 4 * k);
+            tPhysPresetHandle(r, z, st, 72, t.preset, sx86 + 44);
+        }
+        tPhysConstraintsHandle(r, z, pc, 432, tags[p].constraints, px86 + 268);
+        putXStringFromTag(r, z, pc, 448, tags[p].damageSnd);
+        tFxEffectDefHandle(r, z, pc, 456, tags[p].burnFx, px86 + 280);
+        putXStringFromTag(r, z, pc, 464, tags[p].burnSnd);
+    }
+}
+
+// ComWorld: 64 -> 88. Load_ComWorld (db_load.cpp:4972): name, primaryLights[]
+// (220 -> 224, a trailing defName string each), waterCells[] (8, flat),
+// burnableCells[] (12 -> 16, each with 32 bytes of samples).
+enum { AT_COMWORLD = 13, SZ_COMWORLD = 88, SZ_COMPRIMARYLIGHT = 224, SZ_COMBURNCELL = 16 };
+
+static void tComWorld(Reader &r, Prelink &z, Prelink::Loc obj) {
+    uint32_t nameTag = r.u32();
+    uint8_t  inUseCount[8];             // isInUse, primaryLightCount
+    r.bytes(inUseCount, 8);
+    uint32_t lightsTag = r.u32();
+    uint8_t  water[20];                 // waterHeader, numWaterCells
+    r.bytes(water, 20);
+    uint32_t waterTag = r.u32();
+    uint8_t  burn[20];                  // burnableHeader, numBurnableCells
+    r.bytes(burn, 20);
+    uint32_t burnTag = r.u32();
+
+    uint8_t *o = z.at(obj);
+    memcpy(o + 8, inUseCount, 8);
+    memcpy(o + 24, water, 20);
+    memcpy(o + 56, burn, 20);
+    uint32_t nLights, nWater, nBurn;
+    memcpy(&nLights, inUseCount + 4, 4);
+    memcpy(&nWater, water + 16, 4);
+    memcpy(&nBurn, burn + 16, 4);
+
+    putXStringFromTag(r, z, obj, 0, nameTag);
+
+    if (lightsTag != TAG_NULL) {
+        Prelink::Loc tbl = z.alloc(OUT, (size_t)nLights * SZ_COMPRIMARYLIGHT + 1, 8);
+        b4Reserve(3, nLights * 220, tbl);
+        z.putPtr(obj, 16, tbl);
+        std::vector<uint32_t> defTags(nLights);
+        for (uint32_t i = 0; i < nLights; ++i) {
+            r.bytes(z.at(tbl) + i * SZ_COMPRIMARYLIGHT, 216);
+            defTags[i] = r.u32();
+        }
+        for (uint32_t i = 0; i < nLights; ++i)
+            putXStringFromTag(r, z, Prelink::Loc{tbl.blk, tbl.off + i * SZ_COMPRIMARYLIGHT},
+                              216, defTags[i]);
+    }
+
+    if (waterTag != TAG_NULL)
+        tFlatArray(r, z, obj, 48, nWater * 8, 3);
+
+    if (burnTag != TAG_NULL) {
+        Prelink::Loc tbl = z.alloc(OUT, (size_t)nBurn * SZ_COMBURNCELL + 1, 8);
+        b4Reserve(3, nBurn * 12, tbl);
+        z.putPtr(obj, 80, tbl);
+        std::vector<uint32_t> dataTags(nBurn);
+        for (uint32_t i = 0; i < nBurn; ++i) {
+            r.bytes(z.at(tbl) + i * SZ_COMBURNCELL, 8);     // x, y
+            dataTags[i] = r.u32();
+        }
+        for (uint32_t i = 0; i < nBurn; ++i) {
+            if (!dataTags[i]) continue;                     // AllocLoad_raw_byte, 32
+            Prelink::Loc d = z.alloc(OUT, 32, 1);
+            r.bytes(z.at(d), 32);
+            b4Reserve(0, 32, d);
+            z.putPtr(Prelink::Loc{tbl.blk, tbl.off + i * SZ_COMBURNCELL}, 8, d);
+        }
+    }
+}
+
+// ---- table-driven records ---------------------------------------------------
+// From here on struct layouts come from layout_gen.h: X_ offsets into the x86
+// record as the stream holds it, L_ offsets into the LP64 one, SPANS_ for the
+// pointer-free bytes. A transcoder reads a record raw, copies the spans, then
+// deals with each pointer by reading its tag at the X_ offset.
+
+static inline uint32_t rdX(const uint8_t *rec, uint32_t off) {
+    uint32_t v; memcpy(&v, rec + off, 4); return v;
+}
+static inline uint16_t rdX16(const uint8_t *rec, uint32_t off) {
+    uint16_t v; memcpy(&v, rec + off, 2); return v;
+}
+
+template <size_t N>
+static void remap(const LayoutSpan (&sp)[N], const uint8_t *src, uint8_t *dst) {
+    for (const LayoutSpan &s : sp)
+        if (s.n) memcpy(dst + s.l, src + s.x, s.n);
+}
+
+// An array of records read with one Load_Stream: the LP64 table, where its
+// x86 copy starts in block 4, and the raw x86 bytes for the pointer tags.
+struct RecArray {
+    Prelink::Loc tbl = Prelink::none();
+    uint32_t x86 = 0, n = 0, xs = 0, ls = 0;
+    std::vector<uint8_t> raw;
+    const uint8_t *x(uint32_t i) const { return raw.data() + (size_t)i * xs; }
+    Prelink::Loc at(uint32_t i) const { return Prelink::Loc{tbl.blk, tbl.off + i * ls}; }
+    uint32_t slot(uint32_t i, uint32_t xoff) const { return x86 + i * xs + xoff; }
+};
+
+template <size_t N>
+static RecArray tRecords(Reader &r, Prelink &z, uint32_t n, uint32_t xs, uint32_t ls,
+                         const LayoutSpan (&sp)[N], uint32_t allocParam, size_t align,
+                         int line = __builtin_LINE()) {
+    RecArray a;
+    a.n = n; a.xs = xs; a.ls = ls;
+    a.tbl = z.alloc(OUT, n ? (size_t)n * ls : 1, align);
+    a.x86 = b4ReserveRange(allocParam, n * xs, a.tbl, xs, ls, line);
+    a.raw.resize((size_t)n * xs);
+    if (n) r.bytes(a.raw.data(), a.raw.size());
+    for (uint32_t i = 0; i < n; ++i) remap(sp, a.x(i), z.at(a.at(i)));
+    return a;
+}
+#define RECS(T, n, param, align) \
+    tRecords(r, z, (n), X_sizeof_##T, L_sizeof_##T, SPANS_##T, (param), (align))
+
+// The same array hooked into obj.field (when its tag is non-null).
+#define RECS_AT(obj, field, tag, T, n, param, align)                        \
+    ([&]() {                                                                \
+        RecArray a_;                                                        \
+        if (tag) { a_ = RECS(T, n, param, align); z.putPtr(obj, field, a_.tbl); } \
+        return a_;                                                          \
+    }())
+
+// Pointer-free data, identical on both sides: bytes straight across.
+static Prelink::Loc tBytes(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                           uint32_t tag, uint32_t nbytes, uint32_t param, size_t align = 4,
+                           int line = __builtin_LINE()) {
+    if (!tag) return Prelink::none();
+    Prelink::Loc b = z.alloc(OUT, nbytes ? nbytes : 1, align);
+    if (nbytes) r.bytes(z.at(b), nbytes);
+    b4ReserveRange(param, nbytes, b, 1, 1, line);
+    z.putPtr(obj, field, b);
+    return b;
+}
+
+// -1 means the data follows; anything else non-null is an offset to data
+// already loaded (DB_ConvertOffsetToPointer).
+static void tBytesOrOffset(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                           uint32_t tag, uint32_t nbytes, uint32_t param, size_t align = 4) {
+    if (tag == TAG_INLINE) tBytes(r, z, obj, field, tag, nbytes, param, align);
+    else if (tag) putStructOffsetRef(z, obj, field, tag);
+}
+
+// Runtime-block data (DB_PushStreamPos(1)): nothing in the stream, nothing in
+// block 4; the loader hands it out zeroed. Sized for LP64.
+static void tRuntime(Prelink &z, Prelink::Loc obj, uint32_t field, uint32_t tag,
+                     size_t lbytes, size_t align = 8) {
+    if (!tag) return;
+    z.putPtr(obj, field, z.alloc(ZEROBLK, lbytes ? lbytes : 1, align));
+}
+
+// Load_GfxLightDefPtr (db_load.cpp:2649).
+static void tGfxLightDefHandle(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field,
+                               uint32_t tag, uint32_t x86slot = 0) {
+    if (tag == TAG_INLINE || tag == TAG_ALIAS) {
+        Prelink::Loc p = z.alloc(OUT, SZ_LIGHTDEF, 8);
+        tempReserve(16);
+        if (tag == TAG_ALIAS) g_aliasMap[insertPointerSlot()] = p;
+        noteAliasSlot(x86slot, p);
+        tGfxLightDef(r, z, p);
+        z.addAsset(AT_LIGHTDEF, p);
+        z.putPtr(obj, field, p);
+    } else if (tag) {
+        noteAliasSlot(x86slot, putAssetHandleRef(z, obj, field, tag));
+    }
+}
+
+// ---- gfx_map (17) -----------------------------------------------------------
+// GfxWorld: 1084 -> 1672. Load_GfxWorld (db_load.cpp:8525) and the loaders
+// it calls, in their order. GfxWorld's nested structs (draw, lightGrid, dpvs,
+// dpvsDyn, ...) come in with its own 1084 bytes; only what they point at is
+// read later. Vertex and layer buffers (Load_VertexBuffer) are device objects,
+// built on the Switch from vd.vertices / vld.data.
+enum { AT_GFXWORLD = 17 };
+
+static void tGfxCellRefs(Reader &r, Prelink &z, Prelink::Loc c, const uint8_t *cx);
+
+// Load_GfxPortal / Load_GfxPortalArray (db_load.cpp:7897).
+static void tGfxPortals(Reader &r, Prelink &z, Prelink::Loc cell, const uint8_t *cx) {
+    const uint32_t n = rdX(cx, X_GfxCell__portalCount);
+    RecArray a = RECS_AT(cell, L_GfxCell__portals, rdX(cx, X_GfxCell__portals),
+                         GfxPortal, n, 3, 8);
+    for (uint32_t i = 0; i < a.n; ++i) {
+        Prelink::Loc p = a.at(i);
+        const uint8_t *px = a.x(i);
+        uint32_t cellTag = rdX(px, X_GfxPortal__cell);
+        if (cellTag == TAG_INLINE) {                    // Load_GfxCell(1), one cell
+            RecArray one = RECS(GfxCell, 1, 3, 8);
+            z.putPtr(p, L_GfxPortal__cell, one.tbl);
+            tGfxCellRefs(r, z, one.at(0), one.x(0));
+        } else if (cellTag) {
+            putStructOffsetRef(z, p, L_GfxPortal__cell, cellTag);
+        }
+        tBytes(r, z, p, L_GfxPortal__vertices, rdX(px, X_GfxPortal__vertices),
+               12u * px[X_GfxPortal__vertexCount], 3);
+    }
+}
+
+// Load_GfxCell (db_load.cpp:7853), after the cell itself has been read.
+static void tGfxCellRefs(Reader &r, Prelink &z, Prelink::Loc c, const uint8_t *cx) {
+    RecArray trees = RECS_AT(c, L_GfxCell__aabbTree, rdX(cx, X_GfxCell__aabbTree),
+                             GfxAabbTree, rdX(cx, X_GfxCell__aabbTreeCount), 3, 8);
+    for (uint32_t i = 0; i < trees.n; ++i) {
+        const uint8_t *tx = trees.x(i);
+        tBytesOrOffset(r, z, trees.at(i), L_GfxAabbTree__smodelIndexes,
+                       rdX(tx, X_GfxAabbTree__smodelIndexes),
+                       2u * rdX16(tx, X_GfxAabbTree__smodelIndexCount), 1, 2);
+        // childrenOffset is a byte distance to the first child within this
+        // array, counted in x86 records; rescale to the native stride.
+        int32_t off;
+        memcpy(&off, tx + X_GfxAabbTree__childrenOffset, 4);
+        if (off % (int32_t)X_sizeof_GfxAabbTree) {
+            fprintf(stderr, "GfxAabbTree childrenOffset %d is not a whole number of records\n", off);
+            exit(1);
+        }
+        off = off / (int32_t)X_sizeof_GfxAabbTree * (int32_t)L_sizeof_GfxAabbTree;
+        memcpy(z.at(trees.at(i)) + L_GfxAabbTree__childrenOffset, &off, 4);
+    }
+    tGfxPortals(r, z, c, cx);
+    tBytes(r, z, c, L_GfxCell__cullGroups, rdX(cx, X_GfxCell__cullGroups),
+           4u * rdX(cx, X_GfxCell__cullGroupCount), 3);
+    tBytes(r, z, c, L_GfxCell__reflectionProbes, rdX(cx, X_GfxCell__reflectionProbes),
+           cx[X_GfxCell__reflectionProbeCount], 0, 1);
+}
+
+static void tGfxWorld(Reader &r, Prelink &z, Prelink::Loc o) {
+    static_assert(X_sizeof_GfxWorld == 1084, "Load_GfxWorld reads 1084 bytes");
+    uint8_t X[X_sizeof_GfxWorld];
+    r.bytes(X, sizeof(X));
+    remap(SPANS_GfxWorld, X, z.at(o));
+    auto T = [&](uint32_t xoff) { return rdX(X, xoff); };
+
+    putXStringFromTag(r, z, o, L_GfxWorld__name, T(X_GfxWorld__name));
+    putXStringFromTag(r, z, o, L_GfxWorld__baseName, T(X_GfxWorld__baseName));
+
+    // Load_GfxWorldStreamInfo
+    tBytes(r, z, o, L_GfxWorld__streamInfo__aabbTrees, T(X_GfxWorld__streamInfo__aabbTrees),
+           X_sizeof_GfxStreamingAabbTree * T(X_GfxWorld__streamInfo__aabbTreeCount), 3);
+    tBytes(r, z, o, L_GfxWorld__streamInfo__leafRefs, T(X_GfxWorld__streamInfo__leafRefs),
+           4u * T(X_GfxWorld__streamInfo__leafRefCount), 3);
+
+    tBytes(r, z, o, L_GfxWorld__skyStartSurfs, T(X_GfxWorld__skyStartSurfs),
+           4u * T(X_GfxWorld__skySurfCount), 3);
+    tGfxImagePtr(r, z, o, L_GfxWorld__skyImage, T(X_GfxWorld__skyImage));
+    putXStringFromTag(r, z, o, L_GfxWorld__skyBoxModel, T(X_GfxWorld__skyBoxModel));
+
+    if (uint32_t tag = T(X_GfxWorld__sunLight)) {
+        if (tag == TAG_INLINE) {                         // AllocLoad_GfxPackedVertex0
+            RecArray sun = RECS(GfxLight, 1, 15, 16);
+            z.putPtr(o, L_GfxWorld__sunLight, sun.tbl);
+            tGfxLightDefHandle(r, z, sun.at(0), L_GfxLight__def, rdX(sun.x(0), X_GfxLight__def),
+                               sun.slot(0, X_GfxLight__def));
+        } else {
+            putStructOffsetRef(z, o, L_GfxWorld__sunLight, tag);
+        }
+    }
+
+    tBytes(r, z, o, L_GfxWorld__coronas, T(X_GfxWorld__coronas),
+           X_sizeof_GfxLightCorona * T(X_GfxWorld__coronaCount), 3);
+    tBytes(r, z, o, L_GfxWorld__shadowMapVolumes, T(X_GfxWorld__shadowMapVolumes),
+           X_sizeof_GfxShadowMapVolume * T(X_GfxWorld__shadowMapVolumeCount), 3);
+    tBytes(r, z, o, L_GfxWorld__shadowMapVolumePlanes, T(X_GfxWorld__shadowMapVolumePlanes),
+           X_sizeof_GfxVolumePlane * T(X_GfxWorld__shadowMapVolumePlaneCount), 3);
+    tBytes(r, z, o, L_GfxWorld__exposureVolumes, T(X_GfxWorld__exposureVolumes),
+           X_sizeof_GfxExposureVolume * T(X_GfxWorld__exposureVolumeCount), 3);
+    tBytes(r, z, o, L_GfxWorld__exposureVolumePlanes, T(X_GfxWorld__exposureVolumePlanes),
+           X_sizeof_GfxVolumePlane * T(X_GfxWorld__exposureVolumePlaneCount), 3);
+
+    // Load_GfxWorldDpvsPlanes
+    const uint32_t cellCount = T(X_GfxWorld__dpvsPlanes__cellCount);
+    tBytesOrOffset(r, z, o, L_GfxWorld__dpvsPlanes__planes, T(X_GfxWorld__dpvsPlanes__planes),
+                   X_sizeof_cplane_s * T(X_GfxWorld__planeCount), 3);
+    tBytes(r, z, o, L_GfxWorld__dpvsPlanes__nodes, T(X_GfxWorld__dpvsPlanes__nodes),
+           2u * T(X_GfxWorld__nodeCount), 1, 2);
+    tRuntime(z, o, L_GfxWorld__dpvsPlanes__sceneEntCellBits,
+             T(X_GfxWorld__dpvsPlanes__sceneEntCellBits), 4u * (cellCount << 9), 4);
+
+    {
+        RecArray cells = RECS_AT(o, L_GfxWorld__cells, T(X_GfxWorld__cells), GfxCell,
+                                 cellCount, 3, 8);
+        for (uint32_t i = 0; i < cells.n; ++i) tGfxCellRefs(r, z, cells.at(i), cells.x(i));
+    }
+
+    // Load_GfxWorldDraw
+    const uint32_t probeCount = T(X_GfxWorld__draw__reflectionProbeCount);
+    {
+        RecArray probes = RECS_AT(o, L_GfxWorld__draw__reflectionProbes,
+                                  T(X_GfxWorld__draw__reflectionProbes), GfxReflectionProbe,
+                                  probeCount, 3, 8);
+        for (uint32_t i = 0; i < probes.n; ++i) {
+            const uint8_t *px = probes.x(i);
+            tGfxImagePtr(r, z, probes.at(i), L_GfxReflectionProbe__reflectionImage,
+                         rdX(px, X_GfxReflectionProbe__reflectionImage),
+                         probes.slot(i, X_GfxReflectionProbe__reflectionImage));
+            tBytes(r, z, probes.at(i), L_GfxReflectionProbe__probeVolumes,
+                   rdX(px, X_GfxReflectionProbe__probeVolumes),
+                   X_sizeof_GfxReflectionProbeVolumeData *
+                       rdX(px, X_GfxReflectionProbe__probeVolumeCount), 3);
+        }
+    }
+    tRuntime(z, o, L_GfxWorld__draw__reflectionProbeTextures,
+             T(X_GfxWorld__draw__reflectionProbeTextures), (size_t)L_sizeof_GfxTexture * probeCount);
+    const uint32_t lightmapCount = T(X_GfxWorld__draw__lightmapCount);
+    {
+        RecArray lm = RECS_AT(o, L_GfxWorld__draw__lightmaps, T(X_GfxWorld__draw__lightmaps),
+                              GfxLightmapArray, lightmapCount, 3, 8);
+        for (uint32_t i = 0; i < lm.n; ++i) {
+            const uint8_t *lx = lm.x(i);
+            tGfxImagePtr(r, z, lm.at(i), L_GfxLightmapArray__primary,
+                         rdX(lx, X_GfxLightmapArray__primary), lm.slot(i, X_GfxLightmapArray__primary));
+            tGfxImagePtr(r, z, lm.at(i), L_GfxLightmapArray__secondary,
+                         rdX(lx, X_GfxLightmapArray__secondary), lm.slot(i, X_GfxLightmapArray__secondary));
+            tGfxImagePtr(r, z, lm.at(i), L_GfxLightmapArray__secondaryB,
+                         rdX(lx, X_GfxLightmapArray__secondaryB), lm.slot(i, X_GfxLightmapArray__secondaryB));
+        }
+    }
+    tRuntime(z, o, L_GfxWorld__draw__lightmapPrimaryTextures,
+             T(X_GfxWorld__draw__lightmapPrimaryTextures), (size_t)L_sizeof_GfxTexture * lightmapCount);
+    tRuntime(z, o, L_GfxWorld__draw__lightmapSecondaryTextures,
+             T(X_GfxWorld__draw__lightmapSecondaryTextures), (size_t)L_sizeof_GfxTexture * lightmapCount);
+    tRuntime(z, o, L_GfxWorld__draw__lightmapSecondaryTexturesB,
+             T(X_GfxWorld__draw__lightmapSecondaryTexturesB), (size_t)L_sizeof_GfxTexture * lightmapCount);
+    for (uint32_t i = 0; i < 31; ++i)                    // Load_GfxImagePtrArray(0, 31)
+        tGfxImagePtr(r, z, o, L_GfxWorld__draw__terrainScorchImages + 8 * i,
+                     T(X_GfxWorld__draw__terrainScorchImages + 4 * i));
+    tBytes(r, z, o, L_GfxWorld__draw__vd__vertices, T(X_GfxWorld__draw__vd__vertices),
+           X_sizeof_GfxWorldVertex * T(X_GfxWorld__draw__vertexCount), 3);
+    tBytes(r, z, o, L_GfxWorld__draw__vld__data, T(X_GfxWorld__draw__vld__data),
+           T(X_GfxWorld__draw__vertexLayerDataSize), 0, 1);
+    tBytes(r, z, o, L_GfxWorld__draw__indices, T(X_GfxWorld__draw__indices),
+           2u * T(X_GfxWorld__draw__indexCount), 1, 2);
+
+    // Load_GfxLightGrid
+    {
+        uint32_t axis = T(X_GfxWorld__lightGrid__rowAxis);
+        uint32_t rows = 0;
+        if (axis < 3)
+            rows = rdX16(X, X_GfxWorld__lightGrid__maxs + 2 * axis) -
+                   rdX16(X, X_GfxWorld__lightGrid__mins + 2 * axis) + 1u;
+        tBytes(r, z, o, L_GfxWorld__lightGrid__rowDataStart, T(X_GfxWorld__lightGrid__rowDataStart),
+               2u * rows, 1, 2);
+        tBytes(r, z, o, L_GfxWorld__lightGrid__rawRowData, T(X_GfxWorld__lightGrid__rawRowData),
+               T(X_GfxWorld__lightGrid__rawRowDataSize), 3);
+        tBytes(r, z, o, L_GfxWorld__lightGrid__entries, T(X_GfxWorld__lightGrid__entries),
+               X_sizeof_GfxLightGridEntry * T(X_GfxWorld__lightGrid__entryCount), 3);
+        tBytes(r, z, o, L_GfxWorld__lightGrid__colors, T(X_GfxWorld__lightGrid__colors),
+               X_sizeof_GfxCompressedLightGridColors * T(X_GfxWorld__lightGrid__colorCount), 3);
+    }
+
+    tBytes(r, z, o, L_GfxWorld__models, T(X_GfxWorld__models),
+           X_sizeof_GfxBrushModel * T(X_GfxWorld__modelCount), 3);
+    {
+        RecArray mm = RECS_AT(o, L_GfxWorld__materialMemory, T(X_GfxWorld__materialMemory),
+                              MaterialMemory, T(X_GfxWorld__materialMemoryCount), 3, 8);
+        for (uint32_t i = 0; i < mm.n; ++i)
+            tMaterialHandle(r, z, mm.at(i), L_MaterialMemory__material,
+                            rdX(mm.x(i), X_MaterialMemory__material),
+                            mm.slot(i, X_MaterialMemory__material));
+    }
+    tMaterialHandle(r, z, o, L_GfxWorld__sun__spriteMaterial, T(X_GfxWorld__sun__spriteMaterial));
+    tMaterialHandle(r, z, o, L_GfxWorld__sun__flareMaterial, T(X_GfxWorld__sun__flareMaterial));
+    tGfxImagePtr(r, z, o, L_GfxWorld__outdoorImage, T(X_GfxWorld__outdoorImage));
+
+    // Runtime scratch, all block 1.
+    const uint32_t dynModels = T(X_GfxWorld__dpvsDyn__dynEntClientCount);
+    const uint32_t dynBrushes = T(X_GfxWorld__dpvsDyn__dynEntClientCount + 4);
+    const uint32_t lightCount = T(X_GfxWorld__primaryLightCount);
+    const uint32_t nonSunLights = lightCount - (T(X_GfxWorld__sunPrimaryLightIndex) + 1);
+    tRuntime(z, o, L_GfxWorld__cellCasterBits, T(X_GfxWorld__cellCasterBits),
+             4u * cellCount * ((cellCount + 31) >> 5), 4);
+    tRuntime(z, o, L_GfxWorld__sceneDynModel, T(X_GfxWorld__sceneDynModel),
+             (size_t)L_sizeof_GfxSceneDynModel * dynModels, 4);
+    tRuntime(z, o, L_GfxWorld__sceneDynBrush, T(X_GfxWorld__sceneDynBrush),
+             (size_t)L_sizeof_GfxSceneDynBrush * dynBrushes, 4);
+    tRuntime(z, o, L_GfxWorld__primaryLightEntityShadowVis,
+             T(X_GfxWorld__primaryLightEntityShadowVis), 4u * (nonSunLights << 13), 4);
+    tRuntime(z, o, L_GfxWorld__primaryLightDynEntShadowVis,
+             T(X_GfxWorld__primaryLightDynEntShadowVis), 4u * dynModels * nonSunLights, 4);
+    tRuntime(z, o, L_GfxWorld__primaryLightDynEntShadowVis + 8,
+             T(X_GfxWorld__primaryLightDynEntShadowVis + 4), 4u * dynBrushes * nonSunLights, 4);
+    tRuntime(z, o, L_GfxWorld__nonSunPrimaryLightForModelDynEnt,
+             T(X_GfxWorld__nonSunPrimaryLightForModelDynEnt), dynModels, 1);
+
+    {
+        RecArray sg = RECS_AT(o, L_GfxWorld__shadowGeom, T(X_GfxWorld__shadowGeom),
+                              GfxShadowGeometry, lightCount, 3, 8);
+        for (uint32_t i = 0; i < sg.n; ++i) {
+            const uint8_t *gx = sg.x(i);
+            tBytes(r, z, sg.at(i), L_GfxShadowGeometry__sortedSurfIndex,
+                   rdX(gx, X_GfxShadowGeometry__sortedSurfIndex),
+                   2u * rdX16(gx, X_GfxShadowGeometry__surfaceCount), 1, 2);
+            tBytes(r, z, sg.at(i), L_GfxShadowGeometry__smodelIndex,
+                   rdX(gx, X_GfxShadowGeometry__smodelIndex),
+                   2u * rdX16(gx, X_GfxShadowGeometry__smodelCount), 1, 2);
+        }
+    }
+    {
+        RecArray lr = RECS_AT(o, L_GfxWorld__lightRegion, T(X_GfxWorld__lightRegion),
+                              GfxLightRegion, lightCount, 3, 8);
+        for (uint32_t i = 0; i < lr.n; ++i) {
+            const uint8_t *rx = lr.x(i);
+            RecArray hulls = RECS_AT(lr.at(i), L_GfxLightRegion__hulls,
+                                     rdX(rx, X_GfxLightRegion__hulls), GfxLightRegionHull,
+                                     rdX(rx, X_GfxLightRegion__hullCount), 3, 8);
+            for (uint32_t h = 0; h < hulls.n; ++h)
+                tBytes(r, z, hulls.at(h), L_GfxLightRegionHull__axis,
+                       rdX(hulls.x(h), X_GfxLightRegionHull__axis),
+                       X_sizeof_GfxLightRegionAxis * rdX(hulls.x(h), X_GfxLightRegionHull__axisCount), 3);
+        }
+    }
+
+    // Load_GfxWorldDpvsStatic
+    {
+        const uint32_t smodels = T(X_GfxWorld__dpvs__smodelCount);
+        const uint32_t surfs = T(X_GfxWorld__dpvs__staticSurfaceCount);
+        for (int k = 0; k < 3; ++k) {
+            tRuntime(z, o, L_GfxWorld__dpvs__smodelVisData + 8 * k,
+                     T(X_GfxWorld__dpvs__smodelVisData + 4 * k), smodels, 1);
+        }
+        for (int k = 0; k < 3; ++k) {
+            tRuntime(z, o, L_GfxWorld__dpvs__surfaceVisData + 8 * k,
+                     T(X_GfxWorld__dpvs__surfaceVisData + 4 * k), surfs, 1);
+        }
+        tRuntime(z, o, L_GfxWorld__dpvs__smodelVisDataCameraSaved,
+                 T(X_GfxWorld__dpvs__smodelVisDataCameraSaved), smodels, 1);
+        tRuntime(z, o, L_GfxWorld__dpvs__surfaceVisDataCameraSaved,
+                 T(X_GfxWorld__dpvs__surfaceVisDataCameraSaved), surfs, 1);
+        tRuntime(z, o, L_GfxWorld__dpvs__lodData, T(X_GfxWorld__dpvs__lodData),
+                 4u * 2u * T(X_GfxWorld__dpvs__smodelVisDataCount), 128);
+        tBytes(r, z, o, L_GfxWorld__dpvs__sortedSurfIndex, T(X_GfxWorld__dpvs__sortedSurfIndex),
+               2u * surfs, 1, 2);
+        tBytes(r, z, o, L_GfxWorld__dpvs__smodelInsts, T(X_GfxWorld__dpvs__smodelInsts),
+               X_sizeof_GfxStaticModelInst * smodels, 3);
+        {
+            RecArray sf = RECS_AT(o, L_GfxWorld__dpvs__surfaces, T(X_GfxWorld__dpvs__surfaces),
+                                  GfxSurface, T(X_GfxWorld__surfaceCount), 15, 16);
+            for (uint32_t i = 0; i < sf.n; ++i)
+                tMaterialHandle(r, z, sf.at(i), L_GfxSurface__material,
+                                rdX(sf.x(i), X_GfxSurface__material),
+                                sf.slot(i, X_GfxSurface__material));
+        }
+        tBytes(r, z, o, L_GfxWorld__dpvs__cullGroups, T(X_GfxWorld__dpvs__cullGroups),
+               X_sizeof_GfxCullGroup * T(X_GfxWorld__cullGroupCount), 3);
+        {
+            RecArray di = RECS_AT(o, L_GfxWorld__dpvs__smodelDrawInsts,
+                                  T(X_GfxWorld__dpvs__smodelDrawInsts), GfxStaticModelDrawInst,
+                                  smodels, 3, 8);
+            for (uint32_t i = 0; i < di.n; ++i)
+                tXModelHandle(r, z, di.at(i), L_GfxStaticModelDrawInst__model,
+                              rdX(di.x(i), X_GfxStaticModelDrawInst__model),
+                              di.slot(i, X_GfxStaticModelDrawInst__model));
+        }
+        tRuntime(z, o, L_GfxWorld__dpvs__surfaceMaterials, T(X_GfxWorld__dpvs__surfaceMaterials),
+                 (size_t)L_sizeof_GfxDrawSurf * surfs, 8);
+        tRuntime(z, o, L_GfxWorld__dpvs__surfaceCastsSunShadow,
+                 T(X_GfxWorld__dpvs__surfaceCastsSunShadow),
+                 4u * T(X_GfxWorld__dpvs__surfaceVisDataCount), 128);
+    }
+
+    // Load_GfxWorldDpvsDynamic
+    {
+        const uint32_t wc0 = T(X_GfxWorld__dpvsDyn__dynEntClientWordCount);
+        const uint32_t wc1 = T(X_GfxWorld__dpvsDyn__dynEntClientWordCount + 4);
+        tRuntime(z, o, L_GfxWorld__dpvsDyn__dynEntCellBits,
+                 T(X_GfxWorld__dpvsDyn__dynEntCellBits), 4u * cellCount * wc0, 4);
+        tRuntime(z, o, L_GfxWorld__dpvsDyn__dynEntCellBits + 8,
+                 T(X_GfxWorld__dpvsDyn__dynEntCellBits + 4), 4u * cellCount * wc1, 4);
+        // dynEntVisData[2][3]: [i][k] at (i * 3 + k)
+        for (int i = 0; i < 2; ++i)
+            for (int k = 0; k < 3; ++k)
+                tRuntime(z, o, L_GfxWorld__dpvsDyn__dynEntVisData + 8 * (i * 3 + k),
+                         T(X_GfxWorld__dpvsDyn__dynEntVisData + 4 * (i * 3 + k)),
+                         32u * (i ? wc1 : wc0), 16);
+    }
+
+    tBytes(r, z, o, L_GfxWorld__worldLodChains, T(X_GfxWorld__worldLodChains),
+           X_sizeof_GfxWorldLodChain * T(X_GfxWorld__worldLodChainCount), 3);
+    tBytes(r, z, o, L_GfxWorld__worldLodInfos, T(X_GfxWorld__worldLodInfos),
+           X_sizeof_GfxWorldLodInfo * T(X_GfxWorld__worldLodInfoCount), 3);
+    tBytes(r, z, o, L_GfxWorld__worldLodSurfaces, T(X_GfxWorld__worldLodSurfaces),
+           4u * T(X_GfxWorld__worldLodSurfaceCount), 3);
+    for (uint32_t i = 0; i < 2; ++i) {                   // Load_GfxWaterBufferArray(0, 2)
+        uint32_t size = T(X_GfxWorld__waterBuffers__bufferSize + i * X_sizeof_GfxWaterBuffer);
+        tBytes(r, z, o, L_GfxWorld__waterBuffers__buffer + i * L_sizeof_GfxWaterBuffer,
+               T(X_GfxWorld__waterBuffers__buffer + i * X_sizeof_GfxWaterBuffer),
+               16u * (size >> 4), 3);
+    }
+    tMaterialHandle(r, z, o, L_GfxWorld__waterMaterial, T(X_GfxWorld__waterMaterial));
+    tMaterialHandle(r, z, o, L_GfxWorld__coronaMaterial, T(X_GfxWorld__coronaMaterial));
+    tMaterialHandle(r, z, o, L_GfxWorld__ropeMaterial, T(X_GfxWorld__ropeMaterial));
+    tBytes(r, z, o, L_GfxWorld__occluders, T(X_GfxWorld__occluders),
+           X_sizeof_Occluder * T(X_GfxWorld__numOccluders), 3);
+    tBytes(r, z, o, L_GfxWorld__outdoorBounds, T(X_GfxWorld__outdoorBounds),
+           X_sizeof_GfxOutdoorBounds * T(X_GfxWorld__numOutdoorBounds), 3);
+    tBytes(r, z, o, L_GfxWorld__heroLights, T(X_GfxWorld__heroLights),
+           X_sizeof_GfxHeroLight * T(X_GfxWorld__heroLightCount), 3);
+    tBytes(r, z, o, L_GfxWorld__heroLightTree, T(X_GfxWorld__heroLightTree),
+           X_sizeof_GfxHeroLightTree * T(X_GfxWorld__heroLightTreeCount), 3);
+}
+
+// ---- game_map_mp (15) -------------------------------------------------------
+// GameWorldMp: 44 -> 88, a name and a PathData (Load_GameWorldMp,
+// db_load.cpp:3700). The node tree is a union per node: node indexes when
+// axis < 0, two child pointers otherwise (Load_pathnode_tree_info_t).
+enum { AT_GAMEWORLD_SP = 14, AT_GAMEWORLD_MP = 15 };
+
+static void tPathnodeTreeInfo(Reader &r, Prelink &z, Prelink::Loc t, const uint8_t *tx);
+
+// Load_pathnode_tree_t(1): one node, read where it stands.
+static Prelink::Loc tPathnodeTreeOne(Reader &r, Prelink &z) {
+    RecArray one = RECS(pathnode_tree_t, 1, 3, 8);
+    tPathnodeTreeInfo(r, z, one.at(0), one.x(0));
+    return one.tbl;
+}
+
+static void tPathnodeTreeInfo(Reader &r, Prelink &z, Prelink::Loc t, const uint8_t *tx) {
+    const uint32_t u = X_pathnode_tree_t__u, lu = L_pathnode_tree_t__u;
+    Prelink::Loc info{t.blk, t.off + lu};
+    if ((int32_t)rdX(tx, X_pathnode_tree_t__axis) < 0) {
+        uint32_t count = rdX(tx, u + X_pathnode_tree_nodes_t__nodeCount);
+        z.putU32(info, L_pathnode_tree_nodes_t__nodeCount, count);
+        tBytes(r, z, info, L_pathnode_tree_nodes_t__nodes,
+               rdX(tx, u + X_pathnode_tree_nodes_t__nodes), 2u * count, 1, 2);
+        return;
+    }
+    for (uint32_t k = 0; k < 2; ++k) {                   // Load_pathnode_tree_ptrArray(0, 2)
+        uint32_t tag = rdX(tx, u + 4 * k);
+        if (tag == TAG_INLINE) z.putPtr(info, 8 * k, tPathnodeTreeOne(r, z));
+        else if (tag) putStructOffsetRef(z, info, 8 * k, tag);
+    }
+}
+
+static void tGameWorldMp(Reader &r, Prelink &z, Prelink::Loc o) {
+    uint8_t X[X_sizeof_GameWorldMp];
+    r.bytes(X, sizeof(X));
+    remap(SPANS_GameWorldMp, X, z.at(o));
+    auto T = [&](uint32_t xoff) { return rdX(X, xoff); };
+
+    putXStringFromTag(r, z, o, L_GameWorldMp__name, T(X_GameWorldMp__name));
+
+    // Load_PathData (db_load.cpp:3631)
+    const uint32_t nodeCount = T(X_GameWorldMp__path__nodeCount);
+    {
+        RecArray nodes = RECS_AT(o, L_GameWorldMp__path__nodes, T(X_GameWorldMp__path__nodes),
+                                 pathnode_t, nodeCount + 128, 3, 8);
+        for (uint32_t i = 0; i < nodes.n; ++i) {
+            const uint8_t *nx = nodes.x(i);
+            for (uint32_t f : std::initializer_list<uint32_t>{L_pathnode_t__constant__targetname, L_pathnode_t__constant__script_linkName,
+                               L_pathnode_t__constant__script_noteworthy, L_pathnode_t__constant__target,
+                               L_pathnode_t__constant__animscript})
+                markScrStr(z, nodes.at(i), f);
+            tBytes(r, z, nodes.at(i), L_pathnode_t__constant__Links,
+                   rdX(nx, X_pathnode_t__constant__Links),
+                   X_sizeof_pathlink_s * rdX16(nx, X_pathnode_t__constant__totalLinkCount), 3);
+        }
+    }
+    tRuntime(z, o, L_GameWorldMp__path__basenodes, T(X_GameWorldMp__path__basenodes),
+             (size_t)L_sizeof_pathbasenode_t * (nodeCount + 128), 16);
+    tBytes(r, z, o, L_GameWorldMp__path__chainNodeForNode, T(X_GameWorldMp__path__chainNodeForNode),
+           2u * nodeCount, 1, 2);
+    tBytes(r, z, o, L_GameWorldMp__path__nodeForChainNode, T(X_GameWorldMp__path__nodeForChainNode),
+           2u * nodeCount, 1, 2);
+    tBytes(r, z, o, L_GameWorldMp__path__pathVis, T(X_GameWorldMp__path__pathVis),
+           T(X_GameWorldMp__path__visBytes), 0, 1);
+    {
+        RecArray trees = RECS_AT(o, L_GameWorldMp__path__nodeTree, T(X_GameWorldMp__path__nodeTree),
+                                 pathnode_tree_t, T(X_GameWorldMp__path__nodeTreeCount), 3, 8);
+        for (uint32_t i = 0; i < trees.n; ++i) tPathnodeTreeInfo(r, z, trees.at(i), trees.x(i));
+    }
+}
+
+// ---- col_map_mp (12) --------------------------------------------------------
+// clipMap_t: 332 -> 568. Load_clipMap_t (db_load.cpp:4570). Many of its
+// pointers are -1 for "one record follows" and otherwise an offset into an
+// array loaded before it (a brush's sides into brushsides, its verts into
+// brushVerts), which resolveB4 maps record by record.
+enum { AT_CLIPMAP = 11, AT_CLIPMAP_PVS = 12, AT_MAP_ENTS = 16 };
+
+// One cplane_s inline, or an offset to one (Load_cbrushside_t, Load_cNode_t).
+static void tPlaneRef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field, uint32_t tag) {
+    tBytesOrOffset(r, z, obj, field, tag, X_sizeof_cplane_s, 3);
+}
+
+static void tBrushSideRefs(Reader &r, Prelink &z, const RecArray &a) {
+    for (uint32_t i = 0; i < a.n; ++i)
+        tPlaneRef(r, z, a.at(i), L_cbrushside_t__plane, rdX(a.x(i), X_cbrushside_t__plane));
+}
+
+// Load_cbrush_t, after the brush records: sides and verts, each one record
+// inline or an offset.
+static void tBrushRefs(Reader &r, Prelink &z, const RecArray &a) {
+    for (uint32_t i = 0; i < a.n; ++i) {
+        const uint8_t *bx = a.x(i);
+        uint32_t sides = rdX(bx, X_cbrush_t__sides);
+        if (sides == TAG_INLINE) {
+            RecArray one = RECS(cbrushside_t, 1, 3, 8);
+            z.putPtr(a.at(i), L_cbrush_t__sides, one.tbl);
+            tBrushSideRefs(r, z, one);
+        } else if (sides) {
+            putStructOffsetRef(z, a.at(i), L_cbrush_t__sides, sides);
+        }
+        tBytesOrOffset(r, z, a.at(i), L_cbrush_t__verts, rdX(bx, X_cbrush_t__verts), 12, 3);
+    }
+}
+
+// Load_XModelPiecesPtr (db_load.cpp:3381).
+static void tXModelPiecesPtr(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field, uint32_t tag) {
+    if (tag != TAG_INLINE) {
+        if (tag) putStructOffsetRef(z, obj, field, tag);
+        return;
+    }
+    RecArray one = RECS(XModelPieces, 1, 3, 8);
+    z.putPtr(obj, field, one.tbl);
+    const uint8_t *px = one.x(0);
+    putXStringFromTag(r, z, one.at(0), L_XModelPieces__name, rdX(px, X_XModelPieces__name));
+    RecArray pieces = RECS_AT(one.at(0), L_XModelPieces__pieces, rdX(px, X_XModelPieces__pieces),
+                              XModelPiece, rdX(px, X_XModelPieces__numpieces), 3, 8);
+    for (uint32_t i = 0; i < pieces.n; ++i)
+        tXModelHandle(r, z, pieces.at(i), L_XModelPiece__model,
+                      rdX(pieces.x(i), X_XModelPiece__model), pieces.slot(i, X_XModelPiece__model));
+}
+
+// Load_MapEntsPtr (db_load.cpp:4318): an asset of its own.
+static void tMapEntsHandle(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t field, uint32_t tag) {
+    if (tag == TAG_INLINE || tag == TAG_ALIAS) {
+        Prelink::Loc m = z.alloc(OUT, L_sizeof_MapEnts, 8);
+        tempReserve(X_sizeof_MapEnts);
+        if (tag == TAG_ALIAS) g_aliasMap[insertPointerSlot()] = m;
+        uint8_t X[X_sizeof_MapEnts];
+        r.bytes(X, sizeof(X));
+        remap(SPANS_MapEnts, X, z.at(m));
+        putXStringFromTag(r, z, m, L_MapEnts__name, rdX(X, X_MapEnts__name));
+        tBytes(r, z, m, L_MapEnts__entityString, rdX(X, X_MapEnts__entityString),
+               rdX(X, X_MapEnts__numEntityChars), 0, 1);
+        z.addAsset(AT_MAP_ENTS, m);
+        z.putPtr(obj, field, m);
+    } else if (tag) {
+        putAssetHandleRef(z, obj, field, tag);
+    }
+}
+
+static void tClipMap(Reader &r, Prelink &z, Prelink::Loc o) {
+    uint8_t X[X_sizeof_clipMap_t];
+    r.bytes(X, sizeof(X));
+    remap(SPANS_clipMap_t, X, z.at(o));
+    auto T = [&](uint32_t xoff) { return rdX(X, xoff); };
+    auto dynCount = [&](int k) { return (uint32_t)rdX16(X, X_clipMap_t__dynEntCount + 2 * k); };
+
+    putXStringFromTag(r, z, o, L_clipMap_t__name, T(X_clipMap_t__name));
+    tBytesOrOffset(r, z, o, L_clipMap_t__planes, T(X_clipMap_t__planes),
+                   X_sizeof_cplane_s * T(X_clipMap_t__planeCount), 3);
+    {
+        RecArray sm = RECS_AT(o, L_clipMap_t__staticModelList, T(X_clipMap_t__staticModelList),
+                              cStaticModel_s, T(X_clipMap_t__numStaticModels), 3, 8);
+        for (uint32_t i = 0; i < sm.n; ++i)
+            tXModelHandle(r, z, sm.at(i), L_cStaticModel_s__xmodel,
+                          rdX(sm.x(i), X_cStaticModel_s__xmodel), sm.slot(i, X_cStaticModel_s__xmodel));
+    }
+    tBytes(r, z, o, L_clipMap_t__materials, T(X_clipMap_t__materials),
+           X_sizeof_dmaterial_t * T(X_clipMap_t__numMaterials), 3);
+    tBrushSideRefs(r, z, RECS_AT(o, L_clipMap_t__brushsides, T(X_clipMap_t__brushsides),
+                                 cbrushside_t, T(X_clipMap_t__numBrushSides), 3, 8));
+    {
+        RecArray nodes = RECS_AT(o, L_clipMap_t__nodes, T(X_clipMap_t__nodes), cNode_t,
+                                 T(X_clipMap_t__numNodes), 3, 8);
+        for (uint32_t i = 0; i < nodes.n; ++i)
+            tPlaneRef(r, z, nodes.at(i), L_cNode_t__plane, rdX(nodes.x(i), X_cNode_t__plane));
+    }
+    tBytes(r, z, o, L_clipMap_t__leafs, T(X_clipMap_t__leafs),
+           X_sizeof_cLeaf_s * T(X_clipMap_t__numLeafs), 3);
+    tBytes(r, z, o, L_clipMap_t__leafbrushes, T(X_clipMap_t__leafbrushes),
+           2u * T(X_clipMap_t__numLeafBrushes), 1, 2);
+    {
+        // Load_cLeafBrushNode_t: data is the brush list's pointer when there
+        // are brushes, 12 bytes of child planes otherwise.
+        RecArray bn = RECS_AT(o, L_clipMap_t__leafbrushNodes, T(X_clipMap_t__leafbrushNodes),
+                              cLeafBrushNode_s, T(X_clipMap_t__leafbrushNodesCount), 3, 8);
+        for (uint32_t i = 0; i < bn.n; ++i) {
+            const uint8_t *nx = bn.x(i);
+            int16_t count = (int16_t)rdX16(nx, X_cLeafBrushNode_s__leafBrushCount);
+            if (count > 0)
+                tBytesOrOffset(r, z, bn.at(i), L_cLeafBrushNode_s__data,
+                               rdX(nx, X_cLeafBrushNode_s__data), 2u * count, 1, 2);
+            else
+                memcpy(z.at(bn.at(i)) + L_cLeafBrushNode_s__data, nx + X_cLeafBrushNode_s__data,
+                       XN_cLeafBrushNode_s__data);
+        }
+    }
+    tBytes(r, z, o, L_clipMap_t__leafsurfaces, T(X_clipMap_t__leafsurfaces),
+           4u * T(X_clipMap_t__numLeafSurfaces), 3);
+    tBytes(r, z, o, L_clipMap_t__verts, T(X_clipMap_t__verts), 12u * T(X_clipMap_t__vertCount), 3);
+    tBytes(r, z, o, L_clipMap_t__brushVerts, T(X_clipMap_t__brushVerts),
+           12u * T(X_clipMap_t__numBrushVerts), 3);
+    tBytes(r, z, o, L_clipMap_t__uinds, T(X_clipMap_t__uinds), 2u * T(X_clipMap_t__nuinds), 1, 2);
+    const uint32_t triCount = T(X_clipMap_t__triCount);
+    tBytes(r, z, o, L_clipMap_t__triIndices, T(X_clipMap_t__triIndices), 2u * 3u * triCount, 1, 2);
+    tBytes(r, z, o, L_clipMap_t__triEdgeIsWalkable, T(X_clipMap_t__triEdgeIsWalkable),
+           4u * ((3u * triCount + 31) >> 5), 0, 1);
+    tBytes(r, z, o, L_clipMap_t__borders, T(X_clipMap_t__borders),
+           X_sizeof_CollisionBorder * T(X_clipMap_t__borderCount), 3);
+    {
+        RecArray parts = RECS_AT(o, L_clipMap_t__partitions, T(X_clipMap_t__partitions),
+                                 CollisionPartition, T(X_clipMap_t__partitionCount), 3, 8);
+        for (uint32_t i = 0; i < parts.n; ++i)
+            tBytesOrOffset(r, z, parts.at(i), L_CollisionPartition__borders,
+                           rdX(parts.x(i), X_CollisionPartition__borders),
+                           X_sizeof_CollisionBorder, 3);
+    }
+    tBytes(r, z, o, L_clipMap_t__aabbTrees, T(X_clipMap_t__aabbTrees),
+           X_sizeof_CollisionAabbTree * T(X_clipMap_t__aabbTreeCount), 15, 16);
+    tBytes(r, z, o, L_clipMap_t__cmodels, T(X_clipMap_t__cmodels),
+           X_sizeof_cmodel_t * T(X_clipMap_t__numSubModels), 3);
+    tBrushRefs(r, z, RECS_AT(o, L_clipMap_t__brushes, T(X_clipMap_t__brushes), cbrush_t,
+                             T(X_clipMap_t__numBrushes), 15, 16));
+    tBytes(r, z, o, L_clipMap_t__visibility, T(X_clipMap_t__visibility),
+           T(X_clipMap_t__numClusters) * T(X_clipMap_t__clusterBytes), 0, 1);
+    tMapEntsHandle(r, z, o, L_clipMap_t__mapEnts, T(X_clipMap_t__mapEnts));
+    if (uint32_t tag = T(X_clipMap_t__box_brush)) {
+        if (tag == TAG_INLINE) {
+            RecArray one = RECS(cbrush_t, 1, 15, 16);
+            z.putPtr(o, L_clipMap_t__box_brush, one.tbl);
+            tBrushRefs(r, z, one);
+        } else {
+            putStructOffsetRef(z, o, L_clipMap_t__box_brush, tag);
+        }
+    }
+    for (uint32_t k = 0; k < 2; ++k) {
+        RecArray defs = RECS_AT(o, L_clipMap_t__dynEntDefList + 8 * k,
+                                T(X_clipMap_t__dynEntDefList + 4 * k), DynEntityDef,
+                                dynCount(k), 3, 8);
+        for (uint32_t i = 0; i < defs.n; ++i) {             // Load_DynEntityDef
+            const uint8_t *dx = defs.x(i);
+            Prelink::Loc d = defs.at(i);
+            markScrStr(z, d, L_DynEntityDef__targetname);
+            markScrStr(z, d, L_DynEntityDef__target);
+            tXModelHandle(r, z, d, L_DynEntityDef__xModel, rdX(dx, X_DynEntityDef__xModel),
+                          defs.slot(i, X_DynEntityDef__xModel));
+            tXModelHandle(r, z, d, L_DynEntityDef__destroyedxModel,
+                          rdX(dx, X_DynEntityDef__destroyedxModel),
+                          defs.slot(i, X_DynEntityDef__destroyedxModel));
+            tFxEffectDefHandle(r, z, d, L_DynEntityDef__destroyFx, rdX(dx, X_DynEntityDef__destroyFx),
+                               defs.slot(i, X_DynEntityDef__destroyFx));
+            tXModelPiecesPtr(r, z, d, L_DynEntityDef__destroyPieces,
+                             rdX(dx, X_DynEntityDef__destroyPieces));
+            tPhysPresetHandle(r, z, d, L_DynEntityDef__physPreset, rdX(dx, X_DynEntityDef__physPreset),
+                              defs.slot(i, X_DynEntityDef__physPreset));
+        }
+    }
+    for (uint32_t k = 0; k < 2; ++k) {
+        tRuntime(z, o, L_clipMap_t__dynEntPoseList + 8 * k, T(X_clipMap_t__dynEntPoseList + 4 * k),
+                 (size_t)L_sizeof_DynEntityPose * dynCount(k), 8);
+        tRuntime(z, o, L_clipMap_t__dynEntClientList + 8 * k, T(X_clipMap_t__dynEntClientList + 4 * k),
+                 (size_t)L_sizeof_DynEntityClient * dynCount(k), 8);
+        tRuntime(z, o, L_clipMap_t__dynEntServerList + 8 * k, T(X_clipMap_t__dynEntServerList + 4 * k),
+                 (size_t)L_sizeof_DynEntityServer * dynCount(2 + k), 8);
+    }
+    for (uint32_t k = 0; k < 4; ++k)
+        tRuntime(z, o, L_clipMap_t__dynEntCollList + 8 * k, T(X_clipMap_t__dynEntCollList + 4 * k),
+                 (size_t)L_sizeof_DynEntityColl * dynCount(k), 8);
+    {
+        RecArray pc = RECS_AT(o, L_clipMap_t__constraints, T(X_clipMap_t__constraints),
+                              PhysConstraint, T(X_clipMap_t__num_constraints), 3, 8);
+        for (uint32_t i = 0; i < pc.n; ++i) {               // Load_PhysConstraint
+            const uint8_t *cx = pc.x(i);
+            putXStringFromTag(r, z, pc.at(i), L_PhysConstraint__target_bone1,
+                              rdX(cx, X_PhysConstraint__target_bone1));
+            putXStringFromTag(r, z, pc.at(i), L_PhysConstraint__target_bone2,
+                              rdX(cx, X_PhysConstraint__target_bone2));
+            tMaterialHandle(r, z, pc.at(i), L_PhysConstraint__material,
+                            rdX(cx, X_PhysConstraint__material), pc.slot(i, X_PhysConstraint__material));
+        }
+    }
+    tRuntime(z, o, L_clipMap_t__ropes, T(X_clipMap_t__ropes),
+             (size_t)L_sizeof_rope_t * T(X_clipMap_t__max_ropes), 8);
+}
+
+// ---- glasses (41) -----------------------------------------------------------
+// Glasses: 56 -> 72 (Load_Glasses, db_load.cpp:9010). Each glass has its
+// GlassDef inline the first time and as an offset after that.
+enum { AT_GLASSES = 41 };
+
+static void tGlasses(Reader &r, Prelink &z, Prelink::Loc o) {
+    uint8_t X[X_sizeof_Glasses];
+    r.bytes(X, sizeof(X));
+    remap(SPANS_Glasses, X, z.at(o));
+    putXStringFromTag(r, z, o, L_Glasses__name, rdX(X, X_Glasses__name));
+    RecArray gl = RECS_AT(o, L_Glasses__glasses, rdX(X, X_Glasses__glasses), Glass,
+                          rdX(X, X_Glasses__numGlasses), 3, 8);
+    for (uint32_t i = 0; i < gl.n; ++i) {
+        const uint8_t *gx = gl.x(i);
+        uint32_t defTag = rdX(gx, X_Glass__glassDef);
+        if (defTag == TAG_INLINE) {                        // Load_GlassDef(1)
+            RecArray one = RECS(GlassDef, 1, 3, 8);
+            z.putPtr(gl.at(i), L_Glass__glassDef, one.tbl);
+            const uint8_t *dx = one.x(0);
+            Prelink::Loc d = one.at(0);
+            putXStringFromTag(r, z, d, L_GlassDef__name, rdX(dx, X_GlassDef__name));
+            tMaterialHandle(r, z, d, L_GlassDef__pristineMaterial,
+                            rdX(dx, X_GlassDef__pristineMaterial), one.slot(0, X_GlassDef__pristineMaterial));
+            tMaterialHandle(r, z, d, L_GlassDef__crackedMaterial,
+                            rdX(dx, X_GlassDef__crackedMaterial), one.slot(0, X_GlassDef__crackedMaterial));
+            tMaterialHandle(r, z, d, L_GlassDef__shardMaterial,
+                            rdX(dx, X_GlassDef__shardMaterial), one.slot(0, X_GlassDef__shardMaterial));
+            putXStringFromTag(r, z, d, L_GlassDef__crackSound, rdX(dx, X_GlassDef__crackSound));
+            putXStringFromTag(r, z, d, L_GlassDef__shatterShound, rdX(dx, X_GlassDef__shatterShound));
+            putXStringFromTag(r, z, d, L_GlassDef__autoShatterShound,
+                              rdX(dx, X_GlassDef__autoShatterShound));
+            tFxEffectDefHandle(r, z, d, L_GlassDef__crackEffect, rdX(dx, X_GlassDef__crackEffect),
+                               one.slot(0, X_GlassDef__crackEffect));
+            tFxEffectDefHandle(r, z, d, L_GlassDef__shatterEffect, rdX(dx, X_GlassDef__shatterEffect),
+                               one.slot(0, X_GlassDef__shatterEffect));
+        } else if (defTag) {
+            putStructOffsetRef(z, gl.at(i), L_Glass__glassDef, defTag);
+        }
+        tBytes(r, z, gl.at(i), L_Glass__outline, rdX(gx, X_Glass__outline),
+               8u * gx[X_Glass__numOutlineVerts], 3);
+    }
+}
+
+// Pointer-free structs copied with tBytes must be the same on both sides.
+static_assert(X_sizeof_pathlink_s == L_sizeof_pathlink_s, "");
+static_assert(X_sizeof_dmaterial_t == L_sizeof_dmaterial_t, "");
+static_assert(X_sizeof_cLeaf_s == L_sizeof_cLeaf_s, "");
+static_assert(X_sizeof_CollisionBorder == L_sizeof_CollisionBorder, "");
+static_assert(X_sizeof_CollisionAabbTree == L_sizeof_CollisionAabbTree, "");
+static_assert(X_sizeof_cmodel_t == L_sizeof_cmodel_t, "");
+static_assert(X_sizeof_GfxStreamingAabbTree == L_sizeof_GfxStreamingAabbTree, "");
+static_assert(X_sizeof_GfxLightCorona == L_sizeof_GfxLightCorona, "");
+static_assert(X_sizeof_GfxShadowMapVolume == L_sizeof_GfxShadowMapVolume, "");
+static_assert(X_sizeof_GfxVolumePlane == L_sizeof_GfxVolumePlane, "");
+static_assert(X_sizeof_GfxExposureVolume == L_sizeof_GfxExposureVolume, "");
+static_assert(X_sizeof_cplane_s == L_sizeof_cplane_s, "");
+static_assert(X_sizeof_GfxReflectionProbeVolumeData == L_sizeof_GfxReflectionProbeVolumeData, "");
+static_assert(X_sizeof_GfxWorldVertex == L_sizeof_GfxWorldVertex, "");
+static_assert(X_sizeof_GfxLightGridEntry == L_sizeof_GfxLightGridEntry, "");
+static_assert(X_sizeof_GfxCompressedLightGridColors == L_sizeof_GfxCompressedLightGridColors, "");
+static_assert(X_sizeof_GfxBrushModel == L_sizeof_GfxBrushModel, "");
+static_assert(X_sizeof_GfxLightRegionAxis == L_sizeof_GfxLightRegionAxis, "");
+static_assert(X_sizeof_GfxStaticModelInst == L_sizeof_GfxStaticModelInst, "");
+static_assert(X_sizeof_GfxCullGroup == L_sizeof_GfxCullGroup, "");
+static_assert(X_sizeof_GfxWorldLodChain == L_sizeof_GfxWorldLodChain, "");
+static_assert(X_sizeof_GfxWorldLodInfo == L_sizeof_GfxWorldLodInfo, "");
+static_assert(X_sizeof_Occluder == L_sizeof_Occluder, "");
+static_assert(X_sizeof_GfxOutdoorBounds == L_sizeof_GfxOutdoorBounds, "");
+static_assert(X_sizeof_GfxHeroLight == L_sizeof_GfxHeroLight, "");
+static_assert(X_sizeof_GfxHeroLightTree == L_sizeof_GfxHeroLightTree, "");
+
+int main(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: convert <in.ff> <out.kbz>\n"); return 1; }
+    std::vector<uint8_t> file = readFile(argv[1]);
+    if (file.size() < 12 || (memcmp(file.data(), "IWffu100", 8) && memcmp(file.data(), "IWff0100", 8))) {
+        fprintf(stderr, "not an IWff zone\n"); return 1;
+    }
+    std::vector<uint8_t> zone = inflateAll(file.data() + 12, file.size() - 12);
+    uint32_t blockSize4; memcpy(&blockSize4, zone.data() + 8 + 4 * 4, 4); // XFile.blockSize[4]
+    Reader r(zone.data() + 36, zone.size() - 36);                          // skip XFile header
+
+    uint32_t stringCount = r.u32(), stringsTag = r.u32();
+    uint32_t assetCount = r.u32(), assetsTag = r.u32();
+    (void)assetsTag;
+
+    bool dbg = getenv("FFDBG") != nullptr;
+    g_zoneBase = zone.data();
+    g_mtrace = getenv("FFMTRACE") != nullptr;
+    g_traceB4 = getenv("FFB4") != nullptr;
+    Prelink z;
+
+    // Script string list -- Load_ScriptStringList (src/database/db_load.cpp:613).
+    // These come BEFORE the asset type array in the stream. The 8-byte
+    // {count, strings} header was read above; when the pointer tag is non-null
+    // a count*4 pointer array is reserved in block 4, then Load_TempStringArray
+    // reads every tag followed by the inline bodies.
+    //
+    // We parse them so the stream stays in sync and their block-4 offsets land
+    // in the dedup map -- assets reference these strings by offset. They are
+    // g_zoneStrings keeps them for the KBZ script-string section.
+    if (stringCount != 0 && stringsTag != 0) {
+        Prelink::Loc arr = z.alloc(OUT, (size_t)stringCount * 8, 8);
+        b4Reserve(3, stringCount * 4, arr);   // DB_AllocStreamPos(3) -> align 4
+
+        std::vector<uint32_t> strTags(stringCount);
+        for (uint32_t i = 0; i < stringCount; ++i) strTags[i] = r.u32();
+
+        g_zoneStrings.assign(stringCount, std::string());
+        for (uint32_t i = 0; i < stringCount; ++i) {
+            if (strTags[i] == TAG_INLINE) g_zoneStrings[i] = (const char *)r.p;
+            else if (strTags[i] != TAG_NULL)
+                fprintf(stderr, "warning: script string %u is not inline (tag %08x); it maps to null\n",
+                        i, strTags[i]);
+            putXStringFromTag(r, z, arr, i * 8, strTags[i]);
+        }
+    }
+
+    std::vector<uint32_t> types(assetCount), hdrTag(assetCount);
+    for (uint32_t i = 0; i < assetCount; ++i) { types[i] = r.u32(); hdrTag[i] = r.u32(); }
+
+        if (dbg) {
+        std::map<uint32_t, int> hist;
+        for (uint32_t i = 0; i < assetCount; ++i) hist[types[i]]++;
+        fprintf(stderr, "zone has %u assets:\n", assetCount);
+        for (const auto &kv : hist)
+            fprintf(stderr, "  type %2u  x%d\n", kv.first, kv.second);
+        // Stream order, as runs: where each type first stops the converter.
+        fprintf(stderr, "order:");
+        for (uint32_t i = 0; i < assetCount;) {
+            uint32_t j = i;
+            while (j < assetCount && types[j] == types[i]) ++j;
+            fprintf(stderr, " [%u]%u", i, types[i]);
+            if (j - i > 1) fprintf(stderr, "x%u", j - i);
+            i = j;
+        }
+        fprintf(stderr, "\n");
+    }
+
+    // The XAsset array follows the script strings in block 4, so reserve it
+    // rather than resetting the cursor. AllocLoad_FxElemVisStateSample, align 4.
+    if (dbg) fprintf(stderr, "script strings: count=%u  block4 cursor now %u\n",
+                     stringCount, g_x86b4);
+    const uint32_t assetArrayOff = b4Reserve(3, 8 * assetCount, Prelink::none());
+    
+    for (uint32_t i = 0; i < assetCount; ++i) {
+        const uint8_t *pre = r.p;
+        g_curAsset = (int)i;
+        switch (types[i]) {
+        case AT_RAWFILE:     { Prelink::Loc o = z.alloc(OUT, 24, 8); tRawFile(r, z, o);      z.addAsset(AT_RAWFILE, o); break; }
+        case AT_STRINGTABLE: { Prelink::Loc o = z.alloc(OUT, 32, 8); tStringTable(r, z, o);  z.addAsset(AT_STRINGTABLE, o); break; }
+        case AT_LOCALIZE:    { Prelink::Loc o = z.alloc(OUT, 16, 8); tLocalizeEntry(r, z, o); z.addAsset(AT_LOCALIZE, o); break; }
+        case AT_TECHSET:     { Prelink::Loc o = z.alloc(OUT, SZ_TECHSET, 8); tMaterialTechniqueSet(r, z, o); z.addAsset(AT_TECHSET, o); break; }
+        case AT_IMAGE:       { Prelink::Loc o = z.alloc(OUT, SZ_IMAGE, 8); tGfxImage(r, z, o); z.addAsset(AT_IMAGE, o); break; }
+        case AT_MATERIAL:    { Prelink::Loc o = z.alloc(OUT, SZ_MATERIAL, 8); tMaterial(r, z, o); z.addAsset(AT_MATERIAL, o); break; }
+        case AT_PHYSPRESET:  { Prelink::Loc o = z.alloc(OUT, SZ_PHYSPRESET, 8); tPhysPreset(r, z, o); z.addAsset(AT_PHYSPRESET, o); break; }
+        case AT_XGLOBALS:    { Prelink::Loc o = z.alloc(OUT, SZ_XGLOBALS, 8);   tXGlobals(r, z, o);   z.addAsset(AT_XGLOBALS, o);   break; }        
+        case AT_LIGHTDEF:    { Prelink::Loc o = z.alloc(OUT, SZ_LIGHTDEF, 8);  tGfxLightDef(r, z, o); z.addAsset(AT_LIGHTDEF, o); break; }        
+        case AT_PHYSCONSTRAINTS: { Prelink::Loc o = z.alloc(OUT, SZ_PHYSCONSTRAINTS, 8); tPhysConstraints(r, z, o); z.addAsset(AT_PHYSCONSTRAINTS, o); break; }        
+        case AT_XANIM:       { Prelink::Loc o = z.alloc(OUT, SZ_XANIM, 8); tXAnimParts(r, z, o); z.addAsset(AT_XANIM, o); break; }
+        case AT_XMODEL:      { Prelink::Loc o = z.alloc(OUT, SZ_XMODEL, 8); tXModel(r, z, o); z.addAsset(AT_XMODEL, o); break; }        
+        case AT_MENUFILE:    { Prelink::Loc o = z.alloc(OUT, SZ_MENULIST, 8); tMenuList(r, z, o); z.addAsset(AT_MENUFILE, o); break; }
+        case AT_FX:          { Prelink::Loc o = z.alloc(OUT, SZ_FXEFFECTDEF, 8); tFxEffectDef(r, z, o); z.addAsset(AT_FX, o); break; }
+        case AT_WEAPON:      { Prelink::Loc o = z.alloc(OUT, SZ_WEAPONVARIANTDEF, 8); tWeaponVariantDef(r, z, o); z.addAsset(AT_WEAPON, o); break; }
+        case AT_IMPACTFX:    { Prelink::Loc o = z.alloc(OUT, SZ_FXIMPACTTABLE, 8); tFxImpactTable(r, z, o); z.addAsset(AT_IMPACTFX, o); break; }
+        case AT_SNDDRIVERGLOBALS: { Prelink::Loc o = z.alloc(OUT, SZ_SNDDRIVERGLOBALS, 8); tSndDriverGlobals(r, z, o); z.addAsset(AT_SNDDRIVERGLOBALS, o); break; }
+        case AT_FONT:        { Prelink::Loc o = z.alloc(OUT, SZ_FONT, 8); tFont(r, z, o); z.addAsset(AT_FONT, o); break; }
+        case AT_DDL:         { Prelink::Loc o = z.alloc(OUT, SZ_DDLROOT, 8); tDdlRoot(r, z, o); z.addAsset(AT_DDL, o); break; }
+        case AT_SOUND:       { Prelink::Loc o = z.alloc(OUT, SZ_SNDBANK, 8); tSndBank(r, z, o); z.addAsset(AT_SOUND, o); break; }
+        case AT_SOUND_PATCH: { Prelink::Loc o = z.alloc(OUT, SZ_SNDPATCH, 8); tSndPatch(r, z, o); z.addAsset(AT_SOUND_PATCH, o); break; }
+        case AT_EMBLEMSET:   { Prelink::Loc o = z.alloc(OUT, SZ_EMBLEMSET, 8); tEmblemSet(r, z, o); z.addAsset(AT_EMBLEMSET, o); break; }
+        case AT_DESTRUCTIBLEDEF: { Prelink::Loc o = z.alloc(OUT, SZ_DESTRUCTIBLEDEF, 8); tDestructibleDef(r, z, o); z.addAsset(AT_DESTRUCTIBLEDEF, o); break; }
+        case AT_COMWORLD:    { Prelink::Loc o = z.alloc(OUT, SZ_COMWORLD, 8); tComWorld(r, z, o); z.addAsset(AT_COMWORLD, o); break; }
+        case AT_GFXWORLD:    { Prelink::Loc o = z.alloc(OUT, L_sizeof_GfxWorld, 8); tGfxWorld(r, z, o); z.addAsset(AT_GFXWORLD, o); break; }
+        case AT_GAMEWORLD_MP: { Prelink::Loc o = z.alloc(OUT, L_sizeof_GameWorldMp, 8); tGameWorldMp(r, z, o); z.addAsset(AT_GAMEWORLD_MP, o); break; }
+        // GameWorldSp is the same struct {name; PathData} and Load_GameWorldSp the
+        // same loader (db_load.cpp), so the MP transcoder serves both.
+        case AT_GAMEWORLD_SP: { Prelink::Loc o = z.alloc(OUT, L_sizeof_GameWorldMp, 8); tGameWorldMp(r, z, o); z.addAsset(AT_GAMEWORLD_SP, o); break; }
+        case AT_CLIPMAP_PVS: { Prelink::Loc o = z.alloc(OUT, L_sizeof_clipMap_t, 8); tClipMap(r, z, o); z.addAsset(AT_CLIPMAP_PVS, o); break; }
+        // SP maps (col_map_sp) register as CLIPMAP; the loader is the same clipMap_t one.
+        case AT_CLIPMAP: { Prelink::Loc o = z.alloc(OUT, L_sizeof_clipMap_t, 8); tClipMap(r, z, o); z.addAsset(AT_CLIPMAP, o); break; }
+        case AT_GLASSES:     { Prelink::Loc o = z.alloc(OUT, L_sizeof_Glasses, 8); tGlasses(r, z, o); z.addAsset(AT_GLASSES, o); break; }
+        default:
+            fprintf(stderr, "unsupported asset type %u at index %u (Stage 1 = rawfile/stringtable/localize)\n", types[i], i);
+            return 3;
+        }
+        if (dbg)
+            printf("[%3u] type=%2u off=%6zu consumed=%3zd hdrTag=%08x\n",
+                   i, types[i], (size_t)(pre - zone.data()), (ptrdiff_t)(r.p - pre), hdrTag[i]);
+        if (r.overran) { fprintf(stderr, "stream overran at asset %u -- transcoder desync\n", i); return 4; }
+        // XAsset[i].header now holds this asset's pointer, and that slot is
+        // what a later DB_ConvertOffsetToAlias reference dereferences.
+        if (!z.assets.empty()) {
+            const Prelink::AssetRef &a = z.assets.back();
+            g_aliasMap[assetArrayOff + i * 8 + 4] = Prelink::Loc{(int)a.blk, a.off};
+        }
+    }
+
+    // pass 2: resolve deferred block-4 offset refs against the emulated map
+    int resolved = 0, missing = 0, firstBad = -1;
+    for (const Deferred &d : g_deferred) {
+        Prelink::Loc tgt;
+        if (resolveB4(d.x86off, tgt)) { z.putPtr(d.obj, d.field, tgt); ++resolved; }
+        else {
+            ++missing;
+            if (firstBad < 0) firstBad = d.asset;
+            if (dbg && missing <= 20) {
+                uint32_t st = 0, sz = 0; int ln = 0;
+                for (const auto &e : g_b4log)
+                    if (e.off <= d.x86off && e.off >= st) { st = e.off; sz = e.size; ln = e.line; }
+                printf("  UNRESOLVED off=%u (asset %d, ref from line %d) inside [%u,+%u) at +%u  reserved at line %d\n",
+                       d.x86off, d.asset, d.line, st, sz, d.x86off - st, ln);
+            }
+        }
+    }
+
+    z.write(argv[2]);
+    bool b4ok = (g_x86b4 == blockSize4);
+    printf("converted %s -> %s\n", argv[1], argv[2]);
+    printf("  assets=%u  relocs=%zu  outBlock=%zu bytes  streamPos=%zu/%zu\n",
+           assetCount, z.relocs.size(), z.block[OUT].size(), (size_t)(r.p - zone.data()), zone.size());
+    printf("  block4 x86 cursor=%u  header blockSize[4]=%u  %s\n",
+           g_x86b4, blockSize4, b4ok ? "MATCH" : "*** MISMATCH ***");
+    printf("  dedup refs: resolved=%d missing=%d  alias=%d  offOtherBlock=%d\n",
+           resolved, missing, g_cntAlias, g_cntOffOther);
+    printf("  asset handles: resolved=%d missing=%d  otherBlock=%d\n",
+           g_aliasOk, g_aliasBad, g_cntAliasOther);
+    {
+        size_t lists = 0, menus = 0;
+        for (const Prelink::AssetRef &a : z.assets) {
+            if (a.type == AT_MENUFILE) ++lists;
+            else if (a.type == AT_MENU) ++menus;
+        }
+        if (lists || menus)
+            printf("  registered: menulists=%zu menus=%zu (asset table %zu, zone header %u)\n",
+                   lists, menus, z.assets.size(), assetCount);
+    }
+    if (missing) printf("  first unresolved ref comes from asset %d\n", firstBad);
+    printf("  temp (block 0) bytes, not counted in block 4: %u\n", g_x86temp);
+    for (int f = 0; f < 8; ++f)
+        if (g_sndFormatCount[f])
+            printf("  loaded sounds, format %d: %u, %llu bytes\n", f, g_sndFormatCount[f],
+                   (unsigned long long)g_sndFormatBytes[f]);
+    return (b4ok && missing == 0 && g_aliasBad == 0) ? 0 : 5;
+}
+
+// KBZ1 writer.
+void Prelink::write(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "cannot write %s\n", path); exit(1); }
+    uint32_t blkSize[NBLOCK];
+    for (int i = 0; i < NBLOCK; ++i) blkSize[i] = (uint32_t)block[i].size();
+    char magic[4] = {'K','B','Z','1'};
+    uint32_t ver = 3, nblk = NBLOCK;   // 2: script-string section after the assets; 3: effect refs
+    uint32_t rc = (uint32_t)relocs.size(), ac = (uint32_t)assets.size();
+    fwrite(magic, 1, 4, f); fwrite(&ver, 4, 1, f); fwrite(&nblk, 4, 1, f);
+    fwrite(blkSize, 4, NBLOCK, f);
+    fwrite(&rc, 4, 1, f); fwrite(&ac, 4, 1, f);
+    for (int i = 0; i < NBLOCK; ++i) if (i != ZEROBLK && !block[i].empty()) fwrite(block[i].data(), 1, block[i].size(), f);
+    for (auto &rl : relocs) { fwrite(&rl.slotBlk,1,1,f); fwrite(&rl.slotOff,4,1,f); fwrite(&rl.tgtBlk,1,1,f); fwrite(&rl.tgtOff,4,1,f); }
+    for (auto &a : assets)  { fwrite(&a.type,4,1,f); fwrite(&a.blk,1,1,f); fwrite(&a.off,4,1,f); }
+    // Script strings: {u32 count; count x (u16 len, chars)} then
+    // {u32 count; count x (u8 blk, u32 off)} -- the u16 slots holding an index.
+    uint32_t sc = (uint32_t)g_zoneStrings.size(), fc = (uint32_t)scriptStrings.size();
+    fwrite(&sc, 4, 1, f);
+    for (auto &s : g_zoneStrings) { uint16_t l = (uint16_t)s.size(); fwrite(&l, 2, 1, f); fwrite(s.data(), 1, l, f); }
+    fwrite(&fc, 4, 1, f);
+    for (auto &ss : scriptStrings) { fwrite(&ss.first, 1, 1, f); fwrite(&ss.second, 4, 1, f); }
+    // Effect refs by name: {u32 count; count x (u8 blk, u32 off)} -- pointer slots
+    // holding an effect's name, to resolve to the FxEffectDef.
+    uint32_t xc = (uint32_t)fxRefs.size();
+    fwrite(&xc, 4, 1, f);
+    for (auto &fr : fxRefs) { fwrite(&fr.first, 1, 1, f); fwrite(&fr.second, 4, 1, f); }
+    fclose(f);
+}

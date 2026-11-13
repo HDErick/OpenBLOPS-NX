@@ -1,0 +1,41 @@
+name: Campaign checkpoint regressions
+on:
+  push:
+    branches: [campaign-checkpoints]
+  pull_request:
+    paths:
+      - 'src/clientscript/cscr_save*'
+      - 'src/clientscript/cscr_checkpoint_identity.*'
+      - 'src/clientscript/cscr_main.cpp'
+      - 'src/clientscript/cscr_parser.cpp'
+      - 'src/game_mp/checkpoint*'
+      - 'src/game_mp/g_checkpoint*'
+      - 'src/game_mp/g_scr_main_mp.cpp'
+      - 'tools/nx/test-campaign-checkpoints.py'
+      - 'tools/nx/tests/*checkpoint*'
+      - 'tools/nx/tests/test-campaign-restart-progress.py'
+      - '.github/workflows/checkpoint-tests.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  codecs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run asset-free checkpoint regressions
+        run: python3 tools/nx/test-campaign-checkpoints.py --compiler g++
+      - name: Publish result summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          latest = Path('build-nx/checkpoint-tests/latest.json')
+          if latest.exists():
+              result = Path(json.loads(latest.read_text())['result']).read_text()
+              print(result)
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write('Asset-free checkpoint regression result (runtime game tests run locally):\n\n```json\n' + result + '\n```\n')
+          PY

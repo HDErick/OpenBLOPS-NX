@@ -1,0 +1,336 @@
+// Typed visitors for the current native declarations. Pointer owners are explicit.
+template<class V>void WorldFields(V& v,vehicle_spline_node_t& x){
+    v.Field("vehicle_spline_node_t.nextIdx",x.nextIdx);
+    v.Field("vehicle_spline_node_t.prevIdx",x.prevIdx);
+    v.Field("vehicle_spline_node_t.length",x.length);
+    v.Field("vehicle_spline_node_t.dir",x.dir);
+}
+template<class V>void WorldFields(V& v,vehicle_path_node_t& x){
+    v.Field("vehicle_path_node_t.numLinks",x.numLinks);
+    v.Field("vehicle_path_node_t.firstLinkIndex",x.firstLinkIndex);
+    v.Field("vehicle_path_node_t.radius",x.radius);
+}
+template<class V>void WorldFields(V& v,VehicleSeat& x){
+    v.Field("VehicleSeat._occupantEntNum",x._occupantEntNum);
+}
+template<class V>void WorldFields(V& v,vehicle_physic_t& x){
+    v.Field("vehicle_physic_t.origin",x.origin);
+    v.Field("vehicle_physic_t.prevOrigin",x.prevOrigin);
+    v.Field("vehicle_physic_t.angles",x.angles);
+    v.Field("vehicle_physic_t.prevAngles",x.prevAngles);
+    v.Field("vehicle_physic_t.maxAngleVel",x.maxAngleVel);
+    v.Field("vehicle_physic_t.yawAccel",x.yawAccel);
+    v.Field("vehicle_physic_t.yawDecel",x.yawDecel);
+    v.Field("vehicle_physic_t.inputAccelerationOLD",x.inputAccelerationOLD);
+    v.Field("vehicle_physic_t.inputTurning",x.inputTurning);
+    v.Field("vehicle_physic_t.driverPedal",x.driverPedal);
+    v.Field("vehicle_physic_t.driverSteer",x.driverSteer);
+    v.Field("vehicle_physic_t.onGround",x.onGround);
+    v.Field("vehicle_physic_t.colVelDelta",x.colVelDelta);
+    v.Field("vehicle_physic_t.mins",x.mins);
+    v.Field("vehicle_physic_t.maxs",x.maxs);
+    v.Field("vehicle_physic_t.vel",x.vel);
+    v.Field("vehicle_physic_t.bodyVel",x.bodyVel);
+    v.Field("vehicle_physic_t.rotVel",x.rotVel);
+    v.Field("vehicle_physic_t.accel",x.accel);
+    v.Field("vehicle_physic_t.maxPitchAngle",x.maxPitchAngle);
+    v.Field("vehicle_physic_t.maxRollAngle",x.maxRollAngle);
+    v.Field("vehicle_physic_t.wheelZVel",x.wheelZVel);
+    v.Field("vehicle_physic_t.wheelZPos",x.wheelZPos);
+    v.Field("vehicle_physic_t.wheelSurfType",x.wheelSurfType);
+    v.Field("vehicle_physic_t.worldTilt",x.worldTilt);
+    v.Field("vehicle_physic_t.worldTiltVel",x.worldTiltVel);
+    v.Field("vehicle_physic_t.heliLockHeight",x.heliLockHeight);
+    v.Field("vehicle_physic_t.curveLength",x.curveLength);
+    v.Field("vehicle_physic_t.curveID",x.curveID);
+    v.Field("vehicle_physic_t.curveStep",x.curveStep);
+    v.Field("vehicle_physic_t.curveTime",x.curveTime);
+    v.Field("vehicle_physic_t.timeStep",x.timeStep);
+}
+template<class V>void WorldFields(V& v,VehicleHover& x){
+    v.Field("VehicleHover.hoverRadius",x.hoverRadius);
+    v.Field("VehicleHover.hoverSpeed",x.hoverSpeed);
+    v.Field("VehicleHover.hoverAccel",x.hoverAccel);
+    v.Field("VehicleHover.hoverGoalPos",x.hoverGoalPos);
+    v.Field("VehicleHover.useHoverAccelForAngles",x.useHoverAccelForAngles);
+}
+template<class V>void WorldFields(V& v,VehicleTurret& x){
+    v.Field("VehicleTurret.fireTime",x.fireTime);
+    v.Field("VehicleTurret.fireBarrel",x.fireBarrel);
+    v.Field("VehicleTurret.barrelOffset",x.barrelOffset);
+    v.Field("VehicleTurret.flags",x.flags);
+    v.Field("VehicleTurret.heatVal",x.heatVal);
+    v.Field("VehicleTurret.turretOnTargetRange",x.turretOnTargetRange);
+    v.Field("VehicleTurret.overheating",x.overheating);
+    v.Field("VehicleTurret.turretState",x.turretState);
+}
+template<class V>void WorldFields(V& v,VehicleJitter& x){
+    v.Field("VehicleJitter.jitterPeriodMin",x.jitterPeriodMin);
+    v.Field("VehicleJitter.jitterPeriodMax",x.jitterPeriodMax);
+    v.Field("VehicleJitter.jitterEndTime",x.jitterEndTime);
+    v.Field("VehicleJitter.jitterOffsetRange",x.jitterOffsetRange);
+    v.Field("VehicleJitter.jitterDeltaAccel",x.jitterDeltaAccel);
+    v.Field("VehicleJitter.jitterAccel",x.jitterAccel);
+    v.Field("VehicleJitter.jitterPos",x.jitterPos);
+}
+template<class V>void WorldFields(V& v,VehicleTarget& x){
+    v.Field("VehicleTarget.valid",x.valid);
+    v.Field("VehicleTarget.hasTargetYaw",x.hasTargetYaw);
+    v.Field("VehicleTarget.targetEnt",x.targetEnt);
+    v.Field("VehicleTarget.lookAtEnt",x.lookAtEnt);
+    v.Field("VehicleTarget.targetOrigin",x.targetOrigin);
+    v.Field("VehicleTarget.targetOffset",x.targetOffset);
+    v.Field("VehicleTarget.targetYaw",x.targetYaw);
+}
+template<class V>void WorldFields(V& v,VehicleGunnerTags& x){
+    v.Field("VehicleGunnerTags.turret",x.turret);
+    v.Field("VehicleGunnerTags.barrel",x.barrel);
+    v.Field("VehicleGunnerTags.flash",x.flash);
+    v.Field("VehicleGunnerTags.flash2",x.flash2);
+}
+template<class V>void WorldFields(V& v,VehicleTags& x){
+    v.Field("VehicleTags.player",x.player);
+    v.Field("VehicleTags.popout",x.popout);
+    v.Field("VehicleTags.body",x.body);
+    v.Field("VehicleTags.turret",x.turret);
+    v.Field("VehicleTags.turret_base",x.turret_base);
+    v.Field("VehicleTags.barrel",x.barrel);
+    v.Field("VehicleTags.flash",x.flash);
+    for(auto& member:x.gunnerTags)WorldFields(v,member);
+    v.Field("VehicleTags.wheel",x.wheel);
+    v.Field("VehicleTags.seats",x.seats);
+    v.Field("VehicleTags.entryPoints",x.entryPoints);
+}
+template<class V>void WorldFields(V& v,vehicle_cache_t& x){
+    v.Field("vehicle_cache_t.lastOrigin",x.lastOrigin);
+    v.Field("vehicle_cache_t.lastAngles",x.lastAngles);
+    v.Field("vehicle_cache_t.hit_indices",x.hit_indices);
+    v.Field("vehicle_cache_t.hit_sflags",x.hit_sflags);
+    v.Field("vehicle_cache_t.hit_normals",x.hit_normals);
+    v.Field("vehicle_cache_t.hit_fractions",x.hit_fractions);
+    v.Field("vehicle_cache_t.hit_type",x.hit_type);
+    v.Field("vehicle_cache_t.hit_id",x.hit_id);
+    v.Field("vehicle_cache_t.wheel_mask",x.wheel_mask);
+}
+template<class V>void WorldFields(V& v,vehicle_custom_path_t& x){
+    v.Field("vehicle_custom_path_t.pathOrder",x.pathOrder);
+    v.Field("vehicle_custom_path_t.pathLinkIdx",x.pathLinkIdx);
+    v.Field("vehicle_custom_path_t.inUse",x.inUse);
+}
+template<class V>void WorldFields(V& v,vehicle_node_t& x){
+    v.StringId("vehicle_node_t.name",x.name);
+    v.StringId("vehicle_node_t.target",x.target);
+    v.StringId("vehicle_node_t.target2",x.target2);
+    v.StringId("vehicle_node_t.script_linkname",x.script_linkname);
+    v.StringId("vehicle_node_t.script_noteworthy",x.script_noteworthy);
+    v.Field("vehicle_node_t.index",x.index);
+    v.Field("vehicle_node_t.flags",x.flags);
+    v.Field("vehicle_node_t.speed",x.speed);
+    v.Field("vehicle_node_t.lookAhead",x.lookAhead);
+    v.Field("vehicle_node_t.origin",x.origin);
+    v.Field("vehicle_node_t.angles",x.angles);
+    static_assert(sizeof(x.splineNode)==20);v.ScalarUnion("node_shape",&x.splineNode,sizeof(x.splineNode));
+}
+template<class V>void WorldFields(V& v,vehicle_pathpos_t& x){
+    v.Field("vehicle_pathpos_t.nodeIdx",x.nodeIdx);
+    v.Field("vehicle_pathpos_t.lastNodeIdx",x.lastNodeIdx);
+    v.Field("vehicle_pathpos_t.endOfPath",x.endOfPath);
+    v.Field("vehicle_pathpos_t.frac",x.frac);
+    v.Field("vehicle_pathpos_t.speed",x.speed);
+    v.Field("vehicle_pathpos_t.lookAhead",x.lookAhead);
+    v.Field("vehicle_pathpos_t.slide",x.slide);
+    v.Field("vehicle_pathpos_t.origin",x.origin);
+    v.Field("vehicle_pathpos_t.angles",x.angles);
+    v.Field("vehicle_pathpos_t.lookPos",x.lookPos);
+    for(auto& member:x.switchNode)WorldFields(v,member);
+    v.Field("vehicle_pathpos_t.flags",x.flags);
+    v.Field("vehicle_pathpos_t.customGoalLength",x.customGoalLength);
+    v.Field("vehicle_pathpos_t.customGoalDir",x.customGoalDir);
+    v.Ref("custom_path",x.customPath,checkpoint::ResourceKind::CustomVehiclePath);
+}
+template<class V>void WorldFields(V& v,scr_vehicle_s& x){
+    WorldFields(v,x.pathPos);
+    WorldFields(v,x.phys);
+    v.Field("scr_vehicle_s.entNum",x.entNum);
+    v.Field("scr_vehicle_s.infoIdx",x.infoIdx);
+    v.Field("scr_vehicle_s.flags",x.flags);
+    v.Field("scr_vehicle_s.team",x.team);
+    v.Field("scr_vehicle_s.moveState",x.moveState);
+    v.Field("scr_vehicle_s.waitNode",x.waitNode);
+    v.Field("scr_vehicle_s.waitSpeed",x.waitSpeed);
+    WorldFields(v,x.turret);
+    v.Field("scr_vehicle_s.turretRotScale",x.turretRotScale);
+    WorldFields(v,x.jitter);
+    WorldFields(v,x.hover);
+    for(auto& member:x.gunnerTurrets)WorldFields(v,member);
+    for(auto& member:x.gunnerJitter)WorldFields(v,member);
+    v.Field("scr_vehicle_s.lookAtText0",x.lookAtText0);
+    v.Field("scr_vehicle_s.lookAtText1",x.lookAtText1);
+    v.Field("scr_vehicle_s.manualMode",x.manualMode);
+    v.Field("scr_vehicle_s.manualSpeed",x.manualSpeed);
+    v.Field("scr_vehicle_s.manualAccel",x.manualAccel);
+    v.Field("scr_vehicle_s.manualDecel",x.manualDecel);
+    v.Field("scr_vehicle_s.manualTime",x.manualTime);
+    v.Field("scr_vehicle_s.speed",x.speed);
+    v.Field("scr_vehicle_s.maxSpeedOverride",x.maxSpeedOverride);
+    v.Field("scr_vehicle_s.maxDragSpeed",x.maxDragSpeed);
+    v.Field("scr_vehicle_s.turningAbility",x.turningAbility);
+    v.Field("scr_vehicle_s.hasTarget",x.hasTarget);
+    v.Field("scr_vehicle_s.hasTargetYaw",x.hasTargetYaw);
+    v.Field("scr_vehicle_s.hasGoalYaw",x.hasGoalYaw);
+    v.Field("scr_vehicle_s.stopAtGoal",x.stopAtGoal);
+    v.Field("scr_vehicle_s.stopping",x.stopping);
+    v.Field("scr_vehicle_s.targetEnt",x.targetEnt);
+    v.Handle("scr_vehicle_s.lookAtEnt",x.lookAtEnt);
+    v.Field("scr_vehicle_s.targetOrigin",x.targetOrigin);
+    v.Field("scr_vehicle_s.targetOffset",x.targetOffset);
+    v.Field("scr_vehicle_s.targetYaw",x.targetYaw);
+    v.Field("scr_vehicle_s.goalPosition",x.goalPosition);
+    v.Field("scr_vehicle_s.goalYaw",x.goalYaw);
+    v.Field("scr_vehicle_s.prevGoalYaw",x.prevGoalYaw);
+    v.Field("scr_vehicle_s.yawOverShoot",x.yawOverShoot);
+    v.Field("scr_vehicle_s.yawSlowDown",x.yawSlowDown);
+    v.Field("scr_vehicle_s.pathTransitionTime",x.pathTransitionTime);
+    v.Field("scr_vehicle_s.hasDefaultPitch",x.hasDefaultPitch);
+    v.Field("scr_vehicle_s.defaultPitch",x.defaultPitch);
+    v.Field("scr_vehicle_s.hasGoalRoll",x.hasGoalRoll);
+    v.Field("scr_vehicle_s.goalRoll",x.goalRoll);
+    v.Field("scr_vehicle_s.goalRollTime",x.goalRollTime);
+    v.Field("scr_vehicle_s.currentRollTime",x.currentRollTime);
+    v.Field("scr_vehicle_s.numRolls",x.numRolls);
+    for(auto& member:x.gunnerTargets)WorldFields(v,member);
+    v.Field("scr_vehicle_s.nearGoalNotifyDist",x.nearGoalNotifyDist);
+    v.Field("scr_vehicle_s.joltDir",x.joltDir);
+    v.Field("scr_vehicle_s.joltTime",x.joltTime);
+    v.Field("scr_vehicle_s.joltWave",x.joltWave);
+    v.Field("scr_vehicle_s.joltSpeed",x.joltSpeed);
+    v.Field("scr_vehicle_s.joltDecel",x.joltDecel);
+    WorldFields(v,x.boneIndex);
+    v.Field("scr_vehicle_s.turretHitNum",x.turretHitNum);
+    for(auto& member:x.seats)WorldFields(v,member);
+    v.Field("scr_vehicle_s.forcedMaterialSpeed",x.forcedMaterialSpeed);
+    v.Field("scr_vehicle_s.modelSwapDelay",x.modelSwapDelay);
+    v.Field("scr_vehicle_s.oneExhaust",x.oneExhaust);
+    v.Field("scr_vehicle_s.deathQuakeScale",x.deathQuakeScale);
+    v.Field("scr_vehicle_s.deathQuakeDuration",x.deathQuakeDuration);
+    v.Field("scr_vehicle_s.deathQuakeRadius",x.deathQuakeRadius);
+    v.Field("scr_vehicle_s.secTurretAiControlled",x.secTurretAiControlled);
+    v.Field("scr_vehicle_s.frontArmorRegen",x.frontArmorRegen);
+    v.Field("scr_vehicle_s.addToCompass",x.addToCompass);
+    v.Field("scr_vehicle_s.m_bSpecialAbilityEventDown",x.m_bSpecialAbilityEventDown);
+    v.Field("scr_vehicle_s.m_bFirePickupEventDown",x.m_bFirePickupEventDown);
+    v.Field("scr_vehicle_s.m_bSwapPickupEventDown",x.m_bSwapPickupEventDown);
+    v.Field("scr_vehicle_s.m_bDropDeployableEventDown",x.m_bDropDeployableEventDown);
+    WorldFields(v,x.vehicle_cache);
+    v.Field("scr_vehicle_s.heliHeightLockOffset",x.heliHeightLockOffset);
+    v.Ref("vehicle_physics",x.nitrousVehicle,checkpoint::ResourceKind::NitrousVehicle);
+}
+template<class V>void WorldFields(V& v,TurretInfo& x){
+    v.Field("TurretInfo.inuse",x.inuse);
+    v.Field("TurretInfo.state",x.state);
+    v.Field("TurretInfo.flags",x.flags);
+    v.Field("TurretInfo.fireTime",x.fireTime);
+    v.Handle("TurretInfo.manualTarget",x.manualTarget);
+    v.Handle("TurretInfo.target",x.target);
+    v.Field("TurretInfo.targetPos",x.targetPos);
+    v.Field("TurretInfo.targetTime",x.targetTime);
+    v.Field("TurretInfo.missOffsetNormalized",x.missOffsetNormalized);
+    v.Field("TurretInfo.arcmin",x.arcmin);
+    v.Field("TurretInfo.arcmax",x.arcmax);
+    v.Field("TurretInfo.initialYawmin",x.initialYawmin);
+    v.Field("TurretInfo.initialYawmax",x.initialYawmax);
+    v.Field("TurretInfo.forwardAngleDot",x.forwardAngleDot);
+    v.Field("TurretInfo.dropPitch",x.dropPitch);
+    v.Field("TurretInfo.scanningPitch",x.scanningPitch);
+    v.Field("TurretInfo.convergenceTime",x.convergenceTime);
+    v.Field("TurretInfo.suppressTime",x.suppressTime);
+    v.Field("TurretInfo.maxRangeSquared",x.maxRangeSquared);
+    v.Handle("TurretInfo.detachSentient",x.detachSentient);
+    v.Field("TurretInfo.stance",x.stance);
+    v.Field("TurretInfo.prevStance",x.prevStance);
+    v.Field("TurretInfo.fireSndDelay",x.fireSndDelay);
+    v.Field("TurretInfo.accuracy",x.accuracy);
+    v.Field("TurretInfo.userOrigin",x.userOrigin);
+    v.Field("TurretInfo.prevSentTarget",x.prevSentTarget);
+    v.Field("TurretInfo.aiSpread",x.aiSpread);
+    v.Field("TurretInfo.playerSpread",x.playerSpread);
+    v.Field("TurretInfo.eTeam",x.eTeam);
+    v.Field("TurretInfo.heatVal",x.heatVal);
+    v.Field("TurretInfo.overheating",x.overheating);
+    v.Field("TurretInfo.fireBarrel",x.fireBarrel);
+    v.Field("TurretInfo.scanSpeed",x.scanSpeed);
+    v.Field("TurretInfo.scanDecelYaw",x.scanDecelYaw);
+    v.Field("TurretInfo.scanPauseTime",x.scanPauseTime);
+    v.Field("TurretInfo.originError",x.originError);
+    v.Field("TurretInfo.anglesError",x.anglesError);
+    v.Field("TurretInfo.pitchCap",x.pitchCap);
+    v.Field("TurretInfo.triggerDown",x.triggerDown);
+    v.Field("TurretInfo.fireSnd",x.fireSnd);
+    v.Field("TurretInfo.fireSndPlayer",x.fireSndPlayer);
+    v.Field("TurretInfo.stopSnd",x.stopSnd);
+    v.Field("TurretInfo.stopSndPlayer",x.stopSndPlayer);
+}
+template<class V>void WorldFields(V& v,BodyState& x){
+    v.Field("BodyState.position",x.position);
+    v.Field("BodyState.rotation",x.rotation);
+    v.Field("BodyState.velocity",x.velocity);
+    v.Field("BodyState.angVelocity",x.angVelocity);
+    v.Field("BodyState.centerOfMassOffset",x.centerOfMassOffset);
+    v.Field("BodyState.buoyancyBoxMin",x.buoyancyBoxMin);
+    v.Field("BodyState.buoyancyBoxMax",x.buoyancyBoxMax);
+    v.Field("BodyState.mass",x.mass);
+    v.Field("BodyState.friction",x.friction);
+    v.Field("BodyState.bounce",x.bounce);
+    v.Field("BodyState.timeLastAsleep",x.timeLastAsleep);
+    v.Field("BodyState.id",x.id);
+    v.Field("BodyState.buoyancy",x.buoyancy);
+    v.Field("BodyState.underwater",x.underwater);
+}
+template<class V>void WorldFields(V& v,hudelem_s& x){
+    v.Field("hudelem_s.x",x.x);
+    v.Field("hudelem_s.y",x.y);
+    v.Field("hudelem_s.z",x.z);
+    v.Field("hudelem_s.fontScale",x.fontScale);
+    v.Field("hudelem_s.color",x.color.rgba);
+    v.Field("hudelem_s.fromColor",x.fromColor.rgba);
+    v.Field("hudelem_s.fadeStartTime",x.fadeStartTime);
+    v.Field("hudelem_s.scaleStartTime",x.scaleStartTime);
+    v.Field("hudelem_s.fromX",x.fromX);
+    v.Field("hudelem_s.fromY",x.fromY);
+    v.Field("hudelem_s.moveStartTime",x.moveStartTime);
+    v.Field("hudelem_s.time",x.time);
+    v.Field("hudelem_s.duration",x.duration);
+    v.Field("hudelem_s.value",x.value);
+    v.Field("hudelem_s.sort",x.sort);
+    v.Field("hudelem_s.glowColor",x.glowColor.rgba);
+    v.Field("hudelem_s.fxBirthTime",x.fxBirthTime);
+    v.Field("hudelem_s.targetEntNum",x.targetEntNum);
+    v.Field("hudelem_s.fadeTime",x.fadeTime);
+    v.Field("hudelem_s.label",x.label);
+    v.Field("hudelem_s.width",x.width);
+    v.Field("hudelem_s.height",x.height);
+    v.Field("hudelem_s.fromWidth",x.fromWidth);
+    v.Field("hudelem_s.fromHeight",x.fromHeight);
+    v.Field("hudelem_s.scaleTime",x.scaleTime);
+    v.Field("hudelem_s.moveTime",x.moveTime);
+    v.Field("hudelem_s.text",x.text);
+    v.Field("hudelem_s.fxLetterTime",x.fxLetterTime);
+    v.Field("hudelem_s.fxDecayStartTime",x.fxDecayStartTime);
+    v.Field("hudelem_s.fxDecayDuration",x.fxDecayDuration);
+    v.Field("hudelem_s.fxRedactDecayStartTime",x.fxRedactDecayStartTime);
+    v.Field("hudelem_s.fxRedactDecayDuration",x.fxRedactDecayDuration);
+    v.Field("hudelem_s.flags",x.flags);
+    v.Field("hudelem_s.type",x.type);
+    v.Field("hudelem_s.font",x.font);
+    v.Field("hudelem_s.alignOrg",x.alignOrg);
+    v.Field("hudelem_s.alignScreen",x.alignScreen);
+    v.Field("hudelem_s.materialIndex",x.materialIndex);
+    v.Field("hudelem_s.offscreenMaterialIdx",x.offscreenMaterialIdx);
+    v.Field("hudelem_s.fromAlignOrg",x.fromAlignOrg);
+    v.Field("hudelem_s.fromAlignScreen",x.fromAlignScreen);
+    v.Field("hudelem_s.soundID",x.soundID);
+    v.Field("hudelem_s.ui3dWindow",x.ui3dWindow);
+    v.Field("hudelem_s.fromFontScale",x.fromFontScale);
+    v.Field("hudelem_s.fontScaleStartTime",x.fontScaleStartTime);
+    v.Field("hudelem_s.fontScaleTime",x.fontScaleTime);
+}

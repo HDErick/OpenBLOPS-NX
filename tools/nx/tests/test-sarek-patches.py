@@ -1,0 +1,26 @@
+"""Check that the Horizon patches reproduce and apply idempotently."""
+from pathlib import Path
+import hashlib
+import subprocess
+import sys
+
+root=Path(__file__).resolve().parents[3]
+source=root/'build-nx/deps/dxvk-sarek'
+replay=root/'build-nx/sarek-work/patch-replay'
+patch=root/'tools/nx/patch-dxvk-sarek.py'
+assert subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()=='37f397e142b977a343e920dbc4c7bf7ed2c63a81'
+paths=subprocess.check_output(['git','-c','core.autocrlf=true','-c','core.safecrlf=false',
+    '-c','core.filemode=false','-C',str(source),'diff','--ignore-submodules=all','--name-only'],text=True).splitlines()
+for name in ['meson.build',*paths]:
+    path=Path(name)
+    assert not path.is_absolute() and '..' not in path.parts
+    target=replay/path
+    target.parent.mkdir(parents=True,exist_ok=True)
+    target.write_bytes(subprocess.check_output(['git','-C',str(source),'show',f'HEAD:{name}']))
+subprocess.run([sys.executable,str(patch),str(replay)],check=True)
+for name in paths:
+    assert (source/name).read_text()==(replay/name).read_text(), f'Unreproducible patch: {name}'
+first={name:hashlib.sha256((replay/name).read_bytes()).hexdigest() for name in paths}
+subprocess.run([sys.executable,str(patch),str(replay)],check=True)
+assert first=={name:hashlib.sha256((replay/name).read_bytes()).hexdigest() for name in paths}
+print(f'PASS: {len(paths)} modified files reproduce from the pinned release; second application is unchanged')

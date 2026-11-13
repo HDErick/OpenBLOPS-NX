@@ -1,0 +1,248 @@
+// nx_prof.cpp -- the Switch side of PROF_SCOPED (universal/profile.h).
+//
+// Every PROF_SCOPED site the engine already carries (about 600, written for
+// Tracy) adds its ticks and calls to a per-thread slot. Every
+// NX_PROF_REPORT_FRAMES main-thread frames, FrameMark prints the sites that
+// cost the most per frame since the last report, per thread. Times are
+// inclusive: a scope's time contains the scopes nested in it.
+#include <universal/profile.h>
+#include <qcommon/threads.h>
+#include <universal/dvar.h>
+
+#include <switch.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+namespace
+{
+constexpr int NX_PROF_REPORT_FRAMES = 600;
+constexpr int NX_PROF_REPORT_ROWS = 40;
+
+std::atomic<bool> s_enabled{false};
+std::atomic<NxProfSite *> s_sites{nullptr};
+std::atomic<int> s_nextSlot{0};
+char s_threadNames[NX_PROF_THREADS][32];
+thread_local int t_slot = -2;
+
+struct Snapshot
+{
+    uint64_t ticks[NX_PROF_THREADS];
+    uint32_t calls[NX_PROF_THREADS];
+};
+std::unordered_map<NxProfSite *, Snapshot> s_last;
+uint64_t s_lastReportTick;
+int s_frames;
+uint64_t s_framesTotal;
+
+struct Row
+{
+    const char *name;
+    int slot;
+    uint64_t ticks;
+    uint32_t calls;
+};
+}
+
+// The render scopes also timed on the GPU (the GL layer prints them with its
+// summary). Whole frame first; anything not listed -- the HUD, the 2D --
+// is the total less the parts.
+static const char *const s_gpuScopes[] = {
+    "RB_CallExecuteRenderCommands",
+    "RB_StandardDrawCommands",
+    "R_DepthPrepass",
+    "Lit",
+    "LitPostResolve",
+    "Dynamic Lights",
+    "Emissive",
+    "postEmissiveBrightening",
+    "RB_StandardPostEffects",
+    "RB_ApplyLatePostEffects",
+};
+
+int NxProf_GpuScopeCount()
+{
+    return (int)(sizeof(s_gpuScopes) / sizeof(s_gpuScopes[0]));
+}
+
+const char *NxProf_GpuScopeName(int scope)
+{
+    return scope >= 0 && scope < NxProf_GpuScopeCount() ? s_gpuScopes[scope] : "?";
+}
+
+NxProfSite::NxProfSite(const char *siteName) : name(siteName), next(nullptr), ticks(), calls(), gpuScope(-1)
+{
+    for ( int i = 0; i < NxProf_GpuScopeCount(); ++i )
+        if ( !strcmp(siteName, s_gpuScopes[i]) )
+            gpuScope = i;
+    NxProfSite *head = s_sites.load(std::memory_order_relaxed);
+    do
+        next = head;
+    while ( !s_sites.compare_exchange_weak(head, this, std::memory_order_release, std::memory_order_relaxed) );
+}
+
+bool NxProf_Enabled()
+{
+    return s_enabled.load(std::memory_order_relaxed);
+}
+
+int NxProf_ThreadSlot()
+{
+    if ( t_slot == -2 )
+    {
+        const int slot = s_nextSlot.fetch_add(1);
+        t_slot = slot < NX_PROF_THREADS ? slot : -1;
+        if ( t_slot >= 0 && !s_threadNames[t_slot][0] )
+            snprintf(s_threadNames[t_slot], sizeof(s_threadNames[t_slot]), "thread %d", t_slot);
+    }
+    return t_slot;
+}
+
+void NxProf_SetThreadName(const char *threadName)
+{
+    const int slot = NxProf_ThreadSlot();
+    if ( slot >= 0 && threadName )
+        snprintf(s_threadNames[slot], sizeof(s_threadNames[slot]), "%s", threadName);
+}
+
+NxProfSite *volatile g_nxProfStack[NX_PROF_THREADS][NX_PROF_STACK];
+volatile int g_nxProfDepth[NX_PROF_THREADS];
+
+// One line per profiled thread: its name, then the scopes it has open,
+// outermost first. Returns the length written.
+int NxProf_DescribeOpenScopes(char *out, int size)
+{
+    int used = 0;
+    const int threads = s_nextSlot.load() < NX_PROF_THREADS ? s_nextSlot.load() : NX_PROF_THREADS;
+    for ( int slot = 0; slot < threads && used + 64 < size; ++slot )
+    {
+        const int depth = g_nxProfDepth[slot];
+        used += snprintf(out + used, size - used, "[nx-stall]   %-10s depth %d:", s_threadNames[slot][0] ? s_threadNames[slot] : "?", depth);
+        for ( int i = 0; i < depth && i < NX_PROF_STACK && used + 48 < size; ++i )
+        {
+            NxProfSite *site = g_nxProfStack[slot][i];
+            used += snprintf(out + used, size - used, "%s%s", i ? " > " : " ", site && site->name ? site->name : "?");
+        }
+        if ( used + 2 < size )
+            used += snprintf(out + used, size - used, "\n");
+    }
+    return used < size ? used : size - 1;
+}
+
+static void NxProf_Report()
+{
+    const double ticksPerMs = (double)armGetSystemTickFreq() / 1000.0;
+    const uint64_t now = armGetSystemTick();
+    const double wallMs = (double)(now - s_lastReportTick) / ticksPerMs;
+
+    std::vector<Row> rows;
+    for ( NxProfSite *site = s_sites.load(std::memory_order_acquire); site; site = site->next )
+    {
+        Snapshot &last = s_last[site];
+        for ( int slot = 0; slot < NX_PROF_THREADS; ++slot )
+        {
+            const uint64_t ticks = site->ticks[slot];
+            const uint32_t calls = site->calls[slot];
+            if ( ticks != last.ticks[slot] )
+                rows.push_back({site->name, slot, ticks - last.ticks[slot], calls - last.calls[slot]});
+            last.ticks[slot] = ticks;
+            last.calls[slot] = calls;
+        }
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) { return a.ticks > b.ticks; });
+
+    printf("[nx-prof] main frames %llu..%llu: %.1f ms per frame; CPU per frame by scope, inclusive of nested scopes:\n",
+           (unsigned long long)(s_framesTotal - s_frames + 1), (unsigned long long)s_framesTotal,
+           wallMs / s_frames);
+    const int n = (int)std::min<size_t>(rows.size(), NX_PROF_REPORT_ROWS);
+    for ( int i = 0; i < n; ++i )
+    {
+        const Row &r = rows[i];
+        printf("[nx-prof]   %7.2f ms  %7.1f calls  %-10s %s\n",
+               (double)r.ticks / ticksPerMs / s_frames, (double)r.calls / s_frames, s_threadNames[r.slot], r.name);
+    }
+    s_lastReportTick = now;
+    s_frames = 0;
+}
+
+// Hitches: a main-thread frame over NX_HITCH_MS outside loading prints that
+// frame's costliest scopes -- the 600-frame report averages a 1.5 s frame
+// away. Each frame snapshots every site's ticks to diff against the next.
+extern volatile bool g_nxLoadingHint;   // nx_d3d9_null.cpp
+constexpr double NX_HITCH_MS = 100.0;
+constexpr int NX_HITCH_REPORTS = 60;
+static std::unordered_map<NxProfSite *, Snapshot> s_frameLast;
+static uint64_t s_frameLastTick;
+static int s_hitchReports;
+
+static void NxProf_FrameHitch()
+{
+    const uint64_t now = armGetSystemTick();
+    const double ms = s_frameLastTick ? (double)(now - s_frameLastTick) * 1000.0 / armGetSystemTickFreq() : 0.0;
+    const bool report = ms > NX_HITCH_MS && !g_nxLoadingHint && s_hitchReports < NX_HITCH_REPORTS;
+    std::vector<Row> rows;
+    for ( NxProfSite *site = s_sites.load(std::memory_order_acquire); site; site = site->next )
+    {
+        Snapshot &last = s_frameLast[site];
+        for ( int slot = 0; slot < NX_PROF_THREADS; ++slot )
+        {
+            const uint64_t ticks = site->ticks[slot];
+            if ( report && ticks != last.ticks[slot] )
+                rows.push_back({site->name, slot, ticks - last.ticks[slot], site->calls[slot] - last.calls[slot]});
+            last.ticks[slot] = ticks;
+            last.calls[slot] = site->calls[slot];
+        }
+    }
+    s_frameLastTick = now;
+    if ( !report )
+        return;
+    ++s_hitchReports;
+    std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) { return a.ticks > b.ticks; });
+    const double ticksPerMs = (double)armGetSystemTickFreq() / 1000.0;
+    printf("[nx-hitch] main frame %llu took %.1f ms; costliest scopes in it:", (unsigned long long)s_framesTotal, ms);
+    for ( size_t i = 0; i < rows.size() && i < 12; ++i )
+        printf(" | %s %s %.1f (%u)", s_threadNames[rows[i].slot], rows[i].name, rows[i].ticks / ticksPerMs, rows[i].calls);
+    printf("\n");
+}
+
+void NxProf_FrameMark()
+{
+    const int slot = NxProf_ThreadSlot();
+    if ( slot < 0 )
+        return;
+    if ( Sys_IsRenderThread() )
+    {
+        if ( !strncmp(s_threadNames[slot], "thread ", 7) )
+            NxProf_SetThreadName("render");
+        return;
+    }
+    if ( !Sys_IsMainThread() )
+        return;
+    static const dvar_s *telemetry = _Dvar_RegisterBool("nx_telemetry", false, 0,
+        "Enable periodic Switch CPU/GPU/audio diagnostic reports");
+    const bool enabled = telemetry->current.enabled;
+    s_enabled.store(enabled, std::memory_order_relaxed);
+    if ( !enabled )
+    {
+        s_lastReportTick = s_frameLastTick = 0;
+        s_frames = 0;
+        return;
+    }
+    if ( !strncmp(s_threadNames[slot], "thread ", 7) )
+        NxProf_SetThreadName("main");
+    NxProf_FrameHitch();
+    if ( !s_lastReportTick )
+    {
+        s_lastReportTick = armGetSystemTick();
+        return;
+    }
+    ++s_frames;
+    ++s_framesTotal;
+    if ( s_frames >= NX_PROF_REPORT_FRAMES )
+        NxProf_Report();
+}

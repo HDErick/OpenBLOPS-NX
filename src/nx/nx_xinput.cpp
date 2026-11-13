@@ -1,0 +1,146 @@
+// nx_xinput.cpp -- XInput over libnx HID. The game's existing gamepad layer
+// (win_gamepad.cpp GPad_*) drives Switch controllers through this.
+#include <XInput.h>
+#include <switch.h>
+
+#define NX_ERROR_DEVICE_NOT_CONNECTED 1167
+
+#ifdef KISAK_EXPERIMENTAL_SPLITSCREEN
+static constexpr unsigned NX_PAD_COUNT = 2;
+#else
+static constexpr unsigned NX_PAD_COUNT = 1;
+#endif
+static PadState s_pads[NX_PAD_COUNT];
+static bool s_padInit;
+static u32 s_packet[NX_PAD_COUNT];
+
+// Slot zero accepts the handheld controls or controller one. Slot one reads
+// controller two independently; never merge its buttons into the host pad.
+// GPad_Check and XInputGetState each poll, but only read held buttons/sticks.
+static bool nxPadPoll(DWORD userIndex)
+{
+    if (userIndex >= NX_PAD_COUNT)
+        return false;
+    if (!s_padInit) {
+        padConfigureInput(NX_PAD_COUNT, HidNpadStyleSet_NpadStandard);
+        padInitializeDefault(&s_pads[0]);
+#ifdef KISAK_EXPERIMENTAL_SPLITSCREEN
+        padInitialize(&s_pads[1], HidNpadIdType_No2);
+#endif
+        s_padInit = true;
+    }
+    padUpdate(&s_pads[userIndex]);
+    return padIsConnected(&s_pads[userIndex]);
+}
+
+static SHORT nxStick(s32 v)
+{
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    return (SHORT)v;
+}
+
+DWORD XInputGetState(DWORD userIndex, XINPUT_STATE *state)
+{
+    if (!state || !nxPadPoll(userIndex))
+        return NX_ERROR_DEVICE_NOT_CONNECTED;
+
+    memset(state, 0, sizeof(*state));
+    XINPUT_GAMEPAD *gp = &state->Gamepad;
+    u64 keys = padGetButtons(&s_pads[userIndex]);
+
+    // Face buttons are mapped by POSITION, not by label. The game is written
+    // for an Xbox pad, where A (bottom) confirms and B (right) cancels, and
+    // Nintendo swaps both pairs: bottom is B, right is A, left is Y, top is X.
+    // Mapping by position keeps "bottom confirms, right cancels" and every
+    // other face-button binding under the thumb where the game expects it.
+    // Consequence: on-screen prompts still show Xbox glyphs, so a prompt that
+    // says "A" means the Switch B button and "X" means the Switch Y button.
+    WORD buttons = 0;
+    if (keys & HidNpadButton_B) buttons |= XINPUT_GAMEPAD_A; // bottom
+    if (keys & HidNpadButton_A) buttons |= XINPUT_GAMEPAD_B; // right
+    if (keys & HidNpadButton_Y) buttons |= XINPUT_GAMEPAD_X; // left
+    if (keys & HidNpadButton_X) buttons |= XINPUT_GAMEPAD_Y; // top
+    if (keys & HidNpadButton_Plus) buttons |= XINPUT_GAMEPAD_START;
+    if (keys & HidNpadButton_Minus) buttons |= XINPUT_GAMEPAD_BACK;
+    if (keys & HidNpadButton_L) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+    if (keys & HidNpadButton_R) buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+    if (keys & HidNpadButton_StickL) buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
+    if (keys & HidNpadButton_StickR) buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+    if (keys & HidNpadButton_Up) buttons |= XINPUT_GAMEPAD_DPAD_UP;
+    if (keys & HidNpadButton_Down) buttons |= XINPUT_GAMEPAD_DPAD_DOWN;
+    if (keys & HidNpadButton_Left) buttons |= XINPUT_GAMEPAD_DPAD_LEFT;
+    if (keys & HidNpadButton_Right) buttons |= XINPUT_GAMEPAD_DPAD_RIGHT;
+    gp->wButtons = buttons;
+
+    // ZL/ZR are digital on every Switch controller: fully released or fully
+    // pulled, never in between.
+    gp->bLeftTrigger = (keys & HidNpadButton_ZL) ? 255 : 0;
+    gp->bRightTrigger = (keys & HidNpadButton_ZR) ? 255 : 0;
+
+    // HID sticks span +-32767 with +Y up, the same convention as XInput.
+    HidAnalogStickState l = padGetStickPos(&s_pads[userIndex], 0);
+    HidAnalogStickState r = padGetStickPos(&s_pads[userIndex], 1);
+    gp->sThumbLX = nxStick(l.x);
+    gp->sThumbLY = nxStick(l.y);
+    gp->sThumbRX = nxStick(r.x);
+    gp->sThumbRY = nxStick(r.y);
+
+    state->dwPacketNumber = ++s_packet[userIndex];
+    return ERROR_SUCCESS;
+}
+
+DWORD XInputSetState(DWORD userIndex, XINPUT_VIBRATION *vibration)
+{
+    (void)userIndex;
+    (void)vibration; // TODO: HidVibration
+    return ERROR_SUCCESS;
+}
+
+DWORD XInputGetCapabilities(DWORD userIndex, DWORD, XINPUT_CAPABILITIES *caps)
+{
+    // GPad_Check derives GamePad::enabled from this return value, which in
+    // turn fires the game's inserted/removed callbacks.
+    if (!nxPadPoll(userIndex))
+        return NX_ERROR_DEVICE_NOT_CONNECTED;
+    if (caps) {
+        memset(caps, 0, sizeof(*caps));
+        caps->Type = 1;    // XINPUT_DEVTYPE_GAMEPAD
+        caps->SubType = 1; // XINPUT_DEVSUBTYPE_GAMEPAD
+        caps->Gamepad.wButtons = 0xFFFF;
+        caps->Gamepad.bLeftTrigger = 255;
+        caps->Gamepad.bRightTrigger = 255;
+        caps->Gamepad.sThumbLX = 32767;
+        caps->Gamepad.sThumbLY = 32767;
+        caps->Gamepad.sThumbRX = 32767;
+        caps->Gamepad.sThumbRY = 32767;
+        caps->Vibration.wLeftMotorSpeed = 65535;
+        caps->Vibration.wRightMotorSpeed = 65535;
+    }
+    return ERROR_SUCCESS;
+}
+
+void XInputEnable(BOOL) {}
+
+extern "C" void NX_GameWindowSize(int *w, int *h);   // nx_winuser.cpp
+
+// The first finger on the touchscreen, in game window pixels, for the menu
+// cursor (IN_Frame, win_input.cpp). False when nothing touches it, which is
+// always the case docked.
+extern "C" bool NX_TouchPoint(int *x, int *y)
+{
+    static bool s_touchInit;
+    if (!s_touchInit) {
+        hidInitializeTouchScreen();
+        s_touchInit = true;
+    }
+    HidTouchScreenState state = {};
+    if (!hidGetTouchScreenStates(&state, 1) || state.count <= 0)
+        return false;
+    // The touchscreen is 1280x720; the game window is the game resolution.
+    int w, h;
+    NX_GameWindowSize(&w, &h);
+    *x = (int)state.touches[0].x * w / 1280;
+    *y = (int)state.touches[0].y * h / 720;
+    return true;
+}

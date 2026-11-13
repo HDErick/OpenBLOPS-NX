@@ -1,0 +1,39 @@
+:root {
+  color-scheme: dark;
+  font: 16px/1.55 "Instrument Sans", system-ui, sans-serif;
+  color: #efede8;
+  background: #141512;
+  --muted: #b6b5ac;
+  --border: #41433c;
+  --accent: #f8ad58;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { width: min(760px, calc(100% - 2rem)); margin: 0 auto; padding: 4rem 0 2rem; }
+header { border-left: .25rem solid var(--accent); padding-left: 1.25rem; margin-bottom: 2rem; }
+header p { color: var(--muted); margin: .35rem 0 0; }
+.platform { color: var(--accent); letter-spacing: .1em; text-transform: uppercase; font-weight: 700; font-size: .8rem; }
+h1 { margin: .2rem 0; font-size: clamp(2.2rem, 8vw, 4rem); line-height: 1.05; letter-spacing: -.055em; }
+h2 { font-size: 1rem; margin: 0; }
+.setup, .result { border: 1px solid var(--border); background: #20211d; border-radius: .65rem; }
+.step, .action { padding: 1.15rem 1.3rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.step { border-bottom: 1px solid var(--border); }
+.step p, .action p { margin: .15rem 0 0; color: var(--muted); font-size: .92rem; overflow-wrap: anywhere; }
+button, .button { font: inherit; font-weight: 650; color: inherit; background: #30312b; border: 1px solid #5c5e54; padding: .55rem .85rem; border-radius: .4rem; cursor: pointer; white-space: nowrap; }
+button:hover:not(:disabled), .button:hover { border-color: var(--accent); }
+.primary { background: var(--accent); color: #20150a; border-color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+:focus-visible, .step:has(input:focus-visible) .button { outline: 2px solid var(--accent); outline-offset: 3px; }
+.step:has(input:disabled) .button { opacity: .5; cursor: default; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.result { padding: 1rem 1.3rem; margin-top: 1rem; }
+#status { margin: 0 0 .5rem; overflow-wrap: anywhere; }
+progress { display: block; width: 100%; accent-color: var(--accent); }
+details { margin-top: .75rem; }
+li { overflow-wrap: anywhere; }
+footer { display: flex; justify-content: space-between; gap: .5rem 1rem; flex-wrap: wrap; color: var(--muted); font-size: .88rem; margin-top: 1.25rem; }
+a { color: var(--accent); }
+@media (max-width: 540px) {
+  main { padding-top: 2rem; }
+  .step, .action { align-items: flex-start; flex-direction: column; }
+}
