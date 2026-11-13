@@ -1,4 +1,4 @@
-0# OpenBLOPS-NX
+# OpenBLOPS-NX
 
 OpenBLOPS-NX is a source reconstruction of **Black Ops** for Windows PC and Nintendo Switch. Campaign, Multiplayer, and Zombies are playable, including the base-game and DLC Zombies maps.
 
