@@ -576,7 +576,11 @@ void __cdecl R_ToggleSmpFrameCmd(char type)
     {
         PROF_SCOPED("wait frontend workercmds");
         while (!R_FinishedFrontendWorkerCmds())
+#ifdef KISAK_NX
+            R_AssistPendingFrontendWorkerCmds();
+#else
             NET_Sleep(1u);
+#endif
     }
 
     R_UpdateSkinCacheUsage();

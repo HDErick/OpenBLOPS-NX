@@ -33,7 +33,7 @@ loader = (root/'src/nx/nx_kbz.cpp').read_text()
     +function(registry, 'DB_UnloadXZoneMemory')+function(registry, 'DB_UnloadXAssetsMemory'))
 subprocess.run([args.compiler, '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
                 '-DKISAK_NX', '-I'+str(output),
-                str(Path(__file__).with_name('kbz-storage.cpp')), '-o', str(exe)], check=True)
+                str(Path(__file__).with_name('kbz-storage.cpp')), '-lzstd', '-o', str(exe)], check=True)
 zones = sorted(args.zones.glob('*.kbz')) if args.zones else []
 subprocess.run([str(exe), str(output), *map(str, zones)], check=True)
 if args.zones:

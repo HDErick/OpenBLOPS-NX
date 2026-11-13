@@ -22,5 +22,8 @@ void __cdecl Sys_AssistSingle();
 bool __cdecl Sys_AssistSingleCallback(unsigned int *context);
 bool __cdecl Sys_AssistNeeded();
 bool __cdecl R_FinishedFrontendWorkerCmds();
+#ifdef KISAK_NX
+void R_AssistPendingFrontendWorkerCmds();
+#endif
 void __cdecl R_WaitFrontendWorkerCmds();
 void __cdecl R_WaitWorkerCmds();

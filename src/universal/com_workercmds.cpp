@@ -208,29 +208,35 @@ bool __cdecl R_FinishedFrontendWorkerCmds()
     return !jqPoll(&r_skin_cached_staticmodelModule.Group);
 }
 
-void __cdecl R_WaitFrontendWorkerCmds()
+static void R_WaitFrontendGroups(bool pendingOnly)
 {
 #ifdef KISAK_NX
     NX_STALL_SCOPED("Frontend worker wait");
 #endif
 
-    Sys_WaitWorkerCmdInternal(&fx_update_spotWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&fx_updateWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&fx_update_remainingWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&r_dpvs_staticWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&r_dpvs_sceneentWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&r_dpvs_dynmodelWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&r_dpvs_dynbrushWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&r_dpvs_entityWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&r_add_sceneentWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&r_spot_shadow_entWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&dobj_skelWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&dobj_skinWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&fx_drawWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&fx_marks_drawWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&r_model_skinWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&nuge_physicsWorkerCmd);
-    Sys_WaitWorkerCmdInternal(&r_skin_cached_staticmodelWorkerCmd);
+    jqWorkerCmd *const groups[] = {
+        &fx_update_spotWorkerCmd, &fx_updateWorkerCmd, &fx_update_remainingWorkerCmd,
+        &r_dpvs_staticWorkerCmd, &r_dpvs_sceneentWorkerCmd, &r_dpvs_dynmodelWorkerCmd,
+        &r_dpvs_dynbrushWorkerCmd, &r_dpvs_entityWorkerCmd, &r_add_sceneentWorkerCmd,
+        &r_spot_shadow_entWorkerCmd, &dobj_skelWorkerCmd, &dobj_skinWorkerCmd,
+        &fx_drawWorkerCmd, &fx_marks_drawWorkerCmd, &r_model_skinWorkerCmd,
+        &nuge_physicsWorkerCmd, &r_skin_cached_staticmodelWorkerCmd,
+    };
+    for (jqWorkerCmd *command : groups)
+        if (!pendingOnly || jqPoll(&command->module->Group))
+            Sys_WaitWorkerCmdInternal(command);
+}
+
+#ifdef KISAK_NX
+void R_AssistPendingFrontendWorkerCmds()
+{
+    R_WaitFrontendGroups(true);
+}
+#endif
+
+void __cdecl R_WaitFrontendWorkerCmds()
+{
+    R_WaitFrontendGroups(false);
     R_DynSModelWaitWorker();
 }
 

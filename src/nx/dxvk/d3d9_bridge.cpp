@@ -48,6 +48,7 @@ std::unordered_set<const void*> textures;
 ::IDirect3DDevice9* profileDevice = nullptr; // Owns an independent native ref.
 std::atomic<unsigned> errorCount {0};
 std::atomic<bool> stopping {false};
+thread_local bool collectDrawCalls = false;
 thread_local uint64_t drawCalls = 0;
 
 template<typename T> T* unwrap(const IUnknown9Like* handle) {
@@ -152,7 +153,8 @@ void endGpuFrame() {
 }
 
 void onPresent(HRESULT result, uint64_t start) {
-    if (!NxProf_Enabled()) {
+    collectDrawCalls = start != 0;
+    if (!collectDrawCalls) {
         drawCalls=0;
         return;
     }

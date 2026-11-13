@@ -5,6 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <memory>
+#include <zstd.h>
 
 namespace {
 constexpr size_t ReadSize = 256 * 1024;
@@ -14,13 +17,47 @@ struct Reader {
     FILE *file;
     size_t total, completed;
     NxKbzProgress progress;
+    ZSTD_DStream *stream = nullptr;
+    uint8_t *buffer = nullptr;
+    ZSTD_inBuffer input{};
+    bool frameEnded = false;
+
+    bool decompress(void *destination, size_t size, size_t &written) {
+        if (frameEnded) return false;
+        if (input.pos == input.size) {
+            input = {buffer, fread(buffer, 1, ReadSize, file), 0};
+            if (!input.size && ferror(file)) return false;
+        }
+        ZSTD_outBuffer output{destination, size, 0};
+        const size_t before = input.pos;
+        const size_t remaining = ZSTD_decompressStream(stream, &output, &input);
+        if (ZSTD_isError(remaining)) return false;
+        frameEnded = remaining == 0;
+        written = output.pos;
+        return frameEnded || written != 0 || input.pos != before;
+    }
+
+    bool finish() {
+        if (completed != total) return false;
+        if (!stream) return true;
+        uint8_t extra;
+        while (!frameEnded) {
+            size_t written;
+            if (!decompress(&extra, 1, written) || written) return false;
+        }
+        return input.pos == input.size && fgetc(file) == EOF && !ferror(file);
+    }
 
     bool read(void *destination, size_t size) {
         if (size > total - completed) return false;
         auto *out = static_cast<uint8_t *>(destination);
         while (size) {
-            const size_t count = std::min(size, ReadSize);
-            if (fread(out, 1, count, file) != count) return false;
+            size_t count = std::min(size, ReadSize);
+            if (stream) {
+                if (!decompress(out, count, count)) return false;
+            } else if (fread(out, 1, count, file) != count) {
+                return false;
+            }
             out += count;
             size -= count;
             completed += count;
@@ -122,7 +159,8 @@ bool readStorage(Reader &reader, NxKbzStorage &storage) {
         if (i != RuntimeBlock && !reader.read(storage.blocks[i], storage.sizes[i])) return false;
     }
     storage.metadata = static_cast<uint8_t *>(malloc(std::max(size_t(1), storage.metadataSize)));
-    return storage.metadata && reader.read(storage.metadata, storage.metadataSize) && validate(storage);
+    return storage.metadata && reader.read(storage.metadata, storage.metadataSize)
+        && reader.finish() && validate(storage);
 }
 }
 
@@ -138,13 +176,39 @@ int NX_ReadKbz(const char *path, NxKbzStorage **storage, NxKbzProgress progress)
     }
     auto *result = static_cast<NxKbzStorage *>(calloc(1, sizeof(NxKbzStorage)));
     Reader reader{file, size_t(length), 0, progress};
-    if (progress) progress(0, reader.total);
-    const bool ok = result && readStorage(reader, *result);
+    std::unique_ptr<ZSTD_DStream, decltype(&ZSTD_freeDStream)> stream(nullptr, ZSTD_freeDStream);
+    std::unique_ptr<uint8_t, decltype(&free)> buffer(nullptr, free);
+    char magic[4];
+    bool ready = fread(magic, 1, sizeof(magic), file) == sizeof(magic);
+    if (ready && memcmp(magic, "KBZZ", 4) == 0) {
+        uint8_t lengthBytes[8];
+        ready = fread(lengthBytes, 1, sizeof(lengthBytes), file) == sizeof(lengthBytes);
+        if (ready) {
+            uint64_t uncompressedLength = 0;
+            for (unsigned i = 0; i < sizeof(lengthBytes); ++i)
+                uncompressedLength |= uint64_t(lengthBytes[i]) << (8 * i);
+            ready = uncompressedLength >= 20 && uncompressedLength <= std::numeric_limits<size_t>::max();
+            if (ready) {
+                stream.reset(ZSTD_createDStream());
+                buffer.reset(static_cast<uint8_t *>(malloc(ReadSize)));
+                ready = stream && buffer && !ZSTD_isError(ZSTD_initDStream(stream.get()));
+                reader.total = size_t(uncompressedLength);
+                reader.stream = stream.get();
+                reader.buffer = buffer.get();
+            }
+        }
+    } else if (ready) {
+        ready = fseek(file, 0, SEEK_SET) == 0;
+    }
+    if (ready && progress) progress(0, reader.total);
+    const bool ok = ready && result && readStorage(reader, *result);
     fclose(file);
     if (!ok) {
         NX_FreeKbzStorage(result);
         return -1;
     }
+    if (stream)
+        printf("[nx-kbz] packed zone (openblops-kbzz-1): %s, %zu bytes unpacked\n", path, reader.total);
     *storage = result;
     return 1;
 }

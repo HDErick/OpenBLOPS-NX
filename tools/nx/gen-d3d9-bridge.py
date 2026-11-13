@@ -80,9 +80,9 @@ for cls, body in classes:
         if method == 'Reset':
             pre += ['releaseGpuQueries();']
         if method.startswith('Draw'):
-            pre += ['++drawCalls;']
+            pre += ['if (collectDrawCalls) ++drawCalls;']
         if method == 'Present':
-            pre += ['const uint64_t presentStart = armGetSystemTick();']
+            pre += ['const uint64_t presentStart = NxProf_Enabled() ? armGetSystemTick() : 0;']
             post += ['onPresent(result, presentStart);']
         call = f'unwrap<::{cls}>(this)->{method}({", ".join(native_args)})'
         lines += [f'{ret} {cls}::{method}({params}) {{']
