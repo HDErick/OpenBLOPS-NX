@@ -1177,8 +1177,6 @@ void __cdecl AimAssist_UpdateAdsLerp(const AimInput *input)
 
 void __cdecl AimAssist_ApplyTurnRates(const AimInput *input, AimOutput *output)
 {
-    double v2; // st7
-    double v3; // st7
     float v4; // [esp+10h] [ebp-44h]
     float v5; // [esp+14h] [ebp-40h]
     float adjustedYawAxis; // [esp+20h] [ebp-34h] BYREF
@@ -1193,7 +1191,6 @@ void __cdecl AimAssist_ApplyTurnRates(const AimInput *input, AimOutput *output)
     float slowdownPitchScale; // [esp+44h] [ebp-10h] BYREF
     AimAssistGlobals *aaGlob; // [esp+48h] [ebp-Ch]
     float yawSign; // [esp+4Ch] [ebp-8h]
-    float accel; // [esp+50h] [ebp-4h]
 
     slowdownPitchScale = 0.0f;
     slowdownYawScale = 0.0f;
@@ -1243,22 +1240,17 @@ void __cdecl AimAssist_ApplyTurnRates(const AimInput *input, AimOutput *output)
     pitchDelta = fabs(adjustedPitchAxis) * pitchTurnRate;
     //yawDelta = fabs(adjustedYawAxis) * yawTurnRate;
     yawDelta = fabs(adjustedYawAxis) * yawTurnRate;
-    if ( !aim_accel_turnrate_enabled->current.enabled || aim_assist_script_disable->current.enabled )
+#ifndef KISAK_NX
+    if ( aim_accel_turnrate_enabled->current.enabled && !aim_assist_script_disable->current.enabled )
     {
-        aaGlob->pitchDelta = pitchDelta;
-        aaGlob->yawDelta = yawDelta;
-    }
-    else
-    {
-        accel = aim_accel_turnrate_lerp->current.value * sensitivity;
+        const float accel = aim_accel_turnrate_lerp->current.value * sensitivity;
         if ( pitchDelta <= aaGlob->pitchDelta )
         {
             aaGlob->pitchDelta = pitchDelta;
         }
         else
         {
-            v2 = LinearTrack(pitchDelta, aaGlob->pitchDelta, accel, input->deltaTime);
-            aaGlob->pitchDelta = v2;
+            aaGlob->pitchDelta = LinearTrack(pitchDelta, aaGlob->pitchDelta, accel, input->deltaTime);
         }
         if ( yawDelta <= aaGlob->yawDelta )
         {
@@ -1266,14 +1258,19 @@ void __cdecl AimAssist_ApplyTurnRates(const AimInput *input, AimOutput *output)
         }
         else
         {
-            v3 = LinearTrack(yawDelta, aaGlob->yawDelta, accel, input->deltaTime);
-            aaGlob->yawDelta = v3;
+            aaGlob->yawDelta = LinearTrack(yawDelta, aaGlob->yawDelta, accel, input->deltaTime);
         }
         if ( aim_accel_turnrate_debug->current.enabled )
         {
             Com_Printf(17, "Target Pit = %f, Current Pit = %f\n", pitchDelta, aaGlob->pitchDelta);
             Com_Printf(17, "Target Yaw = %f, Current Yaw = %f\n", yawDelta, aaGlob->yawDelta);
         }
+    }
+    else
+#endif
+    {
+        aaGlob->pitchDelta = pitchDelta;
+        aaGlob->yawDelta = yawDelta;
     }
     output->pitch = (float)((float)(aaGlob->pitchDelta * input->deltaTime) * pitchSign) + output->pitch;
     output->yaw = (float)((float)(aaGlob->yawDelta * input->deltaTime) * yawSign) + output->yaw;
