@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 #include <atomic>
+#include <bit>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -127,6 +128,23 @@ struct NxRegistered {
     XAssetType   type;
     XAssetHeader header;
 };
+
+static void fixFrostShader(MaterialPixelShader &shader)
+{
+    auto &loadDef = shader.prog.loadDef;
+    if (!shader.name || std::strcmp(shader.name, "pimp_shader_sw4_2d_frost_2474efee.hlsl") != 0
+        || loadDef.programSize != 187 || !loadDef.program)
+        return;
+
+    DWORD *code = loadDef.program;
+    constexpr DWORD frostConstant[] = {0x05000051, 0xa00f0001, 0x3c23d70a, 0, 0, 0};
+    constexpr DWORD gradientLength[] = {0x0400005a, 0x80080001, 0x80e80001, 0x80e80001, 0xa0550001};
+    if (code[0] == 0xffff0300
+        && std::memcmp(code + 83, frostConstant, sizeof(frostConstant)) == 0
+        && std::memcmp(code + 153, gradientLength, sizeof(gradientLength)) == 0)
+        code[86] = std::bit_cast<DWORD>(1.0e-20f);
+}
+
 static unsigned buildTechniqueSet(XAssetHeader h, NxBuildCtx &)
 {
     MaterialTechniqueSet *techSet = h.techniqueSet;
@@ -145,6 +163,7 @@ static unsigned buildTechniqueSet(XAssetHeader h, NxBuildCtx &)
                 ++built;
             }
             if (pass->pixelShader && !pass->pixelShader->prog.ps) {
+                fixFrostShader(*pass->pixelShader);
                 Load_CreateMaterialPixelShader(&pass->pixelShader->prog.loadDef,
                                                pass->pixelShader);
                 ++built;
