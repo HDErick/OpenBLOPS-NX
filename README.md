@@ -26,6 +26,7 @@ Online server discovery and public listings require a community directory endpoi
 - **Initial base-game Zombies implementation** by [femboyvalve](https://github.com/femboyvalve).
 - **Zombies DLC and the full single-player Campaign implementation** by [NaGaa95](https://github.com/NaGaa95/), who also contributed the original devkitPro scaffolding and mesa-switch work.
 - **Installer idea and compression techniques** by [Chansey](https://github.com/ChanseyIsTheBest), [xsaja](https://github.com/xsaja) and [StevensND](https://github.com/StevensND).
+- **Server design and online functionality** by [ToeKnee](https://github.com/tonytrawl)
 
 ## Other relevant projects
 
