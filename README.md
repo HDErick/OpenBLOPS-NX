@@ -13,7 +13,7 @@ You need your own copy of the PC game and the DLC files for any DLC you want to 
 
 ## Source and setup
 
-- **Windows PC.** With Visual Studio 2022, CMake, and the June 2010 DirectX SDK, run `./tools/pc/build.ps1 -GameFolder "C:/path/to/Call of Duty Black Ops"` in PowerShell. It builds `OpenBLOPS.exe` (Campaign and Zombies) and `OpenBLOPS-MP.exe` (Multiplayer) in `build-nx/PC-build/`.
+- **Windows PC.** With Visual Studio 2022, CMake, and the June 2010 DirectX SDK, run `./tools/pc/build.ps1 -GameFolder "C:/path/to/GAMEFOLDER"` in PowerShell. It builds `OpenBLOPS.exe` (Campaign and Zombies) and `OpenBLOPS-MP.exe` (Multiplayer) in `build-nx/PC-build/`.
 - **Nintendo Switch.** Use the [web installer](installer/README.md) to combine the [latest release](https://github.com/HDErick/OpenBLOPS-NX/releases/latest) with your PC game data and convert the installed zones. To build from source with devkitPro and the project’s Mesa/DXVK dependencies, run `sh tools/nx/build-sarek.sh`. Both NROs go to `build-nx/NX-build/`. [Switch development notes](README-SWITCH.md)
 
 Install the Switch game data and both NROs in `sdmc:/switch/OpenBLOPS-NX/`. Open Homebrew Menu in application mode by holding **R** while opening an installed game. Choose `OpenBLOPS-NX.nro` for Campaign or Zombies or `OpenBLOPS-NX-MP.nro` for Multiplayer.
