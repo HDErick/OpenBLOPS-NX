@@ -7,7 +7,7 @@ The port was made primarily by me and [NaGaa95](https://github.com/NaGaa95/)
 - **Campaign** uses the single-player build and supports saving and resuming at checkpoints.
 - **Multiplayer** uses a separate build. Direct-connect builds include a community server browser, public and password-protected hosting, and offline matches with bots.
 - **Zombies** runs from the single-player build. It supports solo play and online co-op in direct-connect builds with Zombies networking.
-- **Local split-screen** is experimental and requires a build with split-screen enabled.
+- **Local split-screen** is experimental.
 
 You need your own copy of the PC game and the DLC files for any DLC you want to play. This repository contains source code and tools. Game data comes from your installation.
 
