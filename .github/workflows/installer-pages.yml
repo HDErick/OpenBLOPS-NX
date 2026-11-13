@@ -42,6 +42,7 @@ jobs:
           "$RUNNER_TEMP/emsdk/emsdk" install 4.0.20
           "$RUNNER_TEMP/emsdk/emsdk" activate 4.0.20
           source "$RUNNER_TEMP/emsdk/emsdk_env.sh"
+          git clone --depth 1 --branch v1.5.7 https://github.com/facebook/zstd.git build-nx/deps/zstd
           python3 installer/build.py
       - name: Package the latest Switch release
         env:
@@ -49,7 +50,7 @@ jobs:
         run: |
           gh release download --repo "$GITHUB_REPOSITORY" --pattern 'OpenBLOPS-NX.zip' --dir _site/release
           node installer/check-release.mjs _site/release/OpenBLOPS-NX.zip
-          cp installer/index.html installer/style.css installer/app.js installer/release.mjs installer/converter-worker.js _site/
+          cp installer/index.html installer/style.css installer/app.js installer/release.mjs installer/zip-writer.mjs installer/sw.js installer/converter-worker.js _site/
           cp -r installer/generated _site/generated
       - uses: actions/upload-pages-artifact@v3
         with:

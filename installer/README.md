@@ -1,9 +1,18 @@
 # OpenBLOPS-NX Switch installer
 
-Open the installer in desktop Chrome or Edge. Choose the directory containing
-your PC copy's `main/`, `zone/`, and `localization.txt`, then choose your SD card
-or a staging directory. The installer writes `switch/OpenBLOPS-NX/` with both
-Switch executables, the original game data, and converted `kbz/` zones.
+Choose the directory containing your PC copy's `main/`, `zone/`, and
+`localization.txt`. Then either:
+
+- **Save as ZIP** (any current desktop browser): a ZIP holding
+  `switch/OpenBLOPS-NX/` to extract onto the SD card's root. Chrome and Edge ask
+  where to save it; Firefox and Safari stream it as a normal download through
+  the installer's service worker (`sw.js`). The archive is written while it is
+  made (stored ZIP64), so a multi-GB package never has to fit in memory.
+- **Install to folder** (desktop Chrome or Edge): choose your SD card or a
+  staging directory and the installer writes `switch/OpenBLOPS-NX/` there.
+
+Both contain the two Switch executables, the original game data, and converted
+`kbz/` zones.
 
 The browser reads and converts game data locally. It attempts every `.ff` in the
 selected installation, including installed DLC and localized zones. Check the
@@ -36,9 +45,8 @@ automatically.
 Configure Pages to use GitHub Actions, then run **Publish Switch installer**.
 The workflow builds the converter, validates the latest release ZIP, and serves
 it alongside the installer from the same origin. Publishing or editing a stable
-release queues a fresh deployment from `main`. Visitors get both NROs
-automatically when they install. The manual ZIP picker is also available for
-local use or to select a different release.
+release queues a fresh deployment from `main`. Visitors always get both NROs
+from the latest release; there is no manual release picker.
 
 After replacing only the ZIP on an existing release, run the workflow manually
 to refresh the site's copy.
