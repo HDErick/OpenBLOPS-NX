@@ -2,6 +2,8 @@
 
 OpenBLOPS-NX is a source reconstruction of **Call of Duty: Black Ops (2010)** for Windows PC and Nintendo Switch. Campaign, Multiplayer, and Zombies are playable, including the base-game and DLC Zombies maps.
 
+The port was made primarily by me and [NaGaa95](https://github.com/NaGaa95/)
+
 - **Campaign** uses the single-player build and supports saving and resuming at checkpoints.
 - **Multiplayer** uses a separate build. Direct-connect builds include a community server browser, public and password-protected hosting, and offline matches with bots.
 - **Zombies** runs from the single-player build. It supports solo play and online co-op in direct-connect builds with Zombies networking.
