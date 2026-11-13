@@ -27,4 +27,8 @@ Online server discovery and public listings require a community directory endpoi
 - **Zombies DLC and the full single-player Campaign implementation** by [NaGaa95](https://github.com/NaGaa95/), who also contributed the original devkitPro scaffolding and mesa-switch work.
 - **Installer idea and compression techniques** by [Chansey](https://github.com/ChanseyIsTheBest), [xsaja](https://github.com/xsaja) and [StevensND](https://github.com/StevensND).
 
+## Other relevant projects
+
+-- **Black Ops 2 Requiem Project** https://github.com/HDErick/BO2-Requiem-NX, not yet open source but will become pretty soon
+
 Licensed under [GPL-3.0](LICENSE).
