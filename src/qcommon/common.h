@@ -204,6 +204,9 @@ void __cdecl Com_WriteConfiguration(int localClientNum);
 int __cdecl Com_ModifyMsec(int msec);
 void Com_Statmon();
 void __cdecl Com_AdjustMaxFPS(int *maxFPS);
+#ifdef KISAK_NX
+int Com_GetFrameRateLimit();
+#endif
 char Com_UpdateMenu();
 void Com_StartHunkUsers();
 //void __thiscall cdl_proftimer::reset(cdl_proftimer *this);

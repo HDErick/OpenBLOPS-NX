@@ -376,7 +376,11 @@ void __cdecl R_SetD3DPresentParameters(_D3DPRESENT_PARAMETERS_ *d3dpp, const Gfx
     d3dpp->SwapEffect = D3DSWAPEFFECT_DISCARD;
     d3dpp->EnableAutoDepthStencil = 0;
     d3dpp->AutoDepthStencilFormat = dx.depthStencilFormat;
+#ifdef KISAK_NX
+    d3dpp->PresentationInterval = D3DPRESENT_INTERVAL_ONE;
+#else
     d3dpp->PresentationInterval = r_vsync->current.enabled ? 1 : 0x80000000;
+#endif
     if ( !wndParms->hwnd
         && !Assert_MyHandler("C:\\projects_pc\\cod\\codsrc\\src\\gfx_d3d\\r_init.cpp", 425, 0, "%s", "wndParms->hwnd") )
     {
@@ -561,7 +565,9 @@ void __cdecl R_CheckResizeWindow()
         || Dvar_HasLatchedValue(r_fullscreen)
         || Dvar_HasLatchedValue(r_aaSamples)
         || Dvar_HasLatchedValue(r_displayRefresh)
+#ifndef KISAK_NX
         || Dvar_HasLatchedValue(r_vsync)
+#endif
         || Dvar_HasLatchedValue(r_fullscreen) )
     {
         dx.resizeWindow = 1;
@@ -583,7 +589,9 @@ void __cdecl R_ResizeWindow()
     Dvar_MakeLatchedValueCurrent((dvar_s*)r_mode);
     Dvar_MakeLatchedValueCurrent((dvar_s*)r_fullscreen);
     Dvar_MakeLatchedValueCurrent((dvar_s*)r_aaSamples);
+#ifndef KISAK_NX
     Dvar_MakeLatchedValueCurrent((dvar_s*)r_vsync);
+#endif
     Dvar_MakeLatchedValueCurrent((dvar_s*)r_fullscreen);
     Dvar_MakeLatchedValueCurrent((dvar_s*)r_displayRefresh);
     R_SetWndParms(&wndParms);

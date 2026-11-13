@@ -67,6 +67,11 @@ delete it to return to them.
   random `playerNNNN` there.
 - `dxvk-sarek.conf` next to the executables configures DXVK (a copy is in
   `switch-meta/`).
+- Set **FPS Limit** under **Options > Graphics**. The engine applies the
+  limit immediately and saves it. Until you pick a preset, the game uses
+  `com_maxfps`. Use the in-game limit in place of `dxvk.maxFrameRate`.
+  Change **VSync** in the same menu. Remove any `+set r_vsync` override
+  from `cmdline.txt` to keep your menu choice after restarting the game.
 - Online play: the community server browser and public hosting need a
   directory endpoint, `+set bo1_directory IPv4:port` (or the build's default).
   Direct-IP and offline matches with bots need nothing.

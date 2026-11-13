@@ -4341,6 +4341,9 @@ void __cdecl Item_TextField_BeginEdit(int localClientNum, int contextIndex, item
 
 static void UI_NX_AddAimAssistOption(menuDef_t *menu);
 static void UI_AddPerformanceOverlayOption(menuDef_t *menu);
+#ifdef KISAK_NX
+static void UI_NX_AddFrameRateOption(menuDef_t *menu);
+#endif
 void __cdecl Menus_Open(int localClientNum, UiContext *dc, menuDef_t *menu)
 {
     // MP: common_mp carries its own copies of the options menus, and loading it
@@ -4349,6 +4352,9 @@ void __cdecl Menus_Open(int localClientNum, UiContext *dc, menuDef_t *menu)
     // back when the menu opens (a no-op when they are there).
     UI_NX_AddAimAssistOption(menu);
     UI_AddPerformanceOverlayOption(menu);
+#ifdef KISAK_NX
+    UI_NX_AddFrameRateOption(menu);
+#endif
 #ifdef KISAK_EXPERIMENTAL_SPLITSCREEN
     UI_SplitScreenMenuOpening(localClientNum, dc, menu);
 #endif
@@ -5924,9 +5930,17 @@ int __cdecl Item_Multi_CountSettings(itemDef_s *item)
         return 0;
 }
 
+static float Item_Multi_GetFloatValue(const itemDef_s *item)
+{
+#ifdef KISAK_NX
+    if ( item->dvar && !I_stricmp(item->dvar, "nx_fpsLimit") )
+        return (float)Com_GetFrameRateLimit();
+#endif
+    return (float)atof(Dvar_GetVariantString(item->dvar));
+}
+
 int __cdecl Item_Multi_FindDvarByValue(itemDef_s *item)
 {
-    const char *VariantString; // eax
     multiDef_s *multiPtr; // [esp+0h] [ebp-10h]
     const char *string; // [esp+4h] [ebp-Ch]
     int i; // [esp+8h] [ebp-8h]
@@ -5947,8 +5961,7 @@ int __cdecl Item_Multi_FindDvarByValue(itemDef_s *item)
     }
     else
     {
-        VariantString = Dvar_GetVariantString(item->dvar);
-        value = atof(VariantString);
+        value = Item_Multi_GetFloatValue(item);
         for ( ia = 0; ia < multiPtr->count; ++ia )
         {
             if ( multiPtr->dvarValue[ia] == value )
@@ -6582,6 +6595,14 @@ int __cdecl Item_Slider_HandleKey(UiContext *dc, itemDef_s *item, int key)
 
 void __cdecl Item_Action(int localClientNum, UiContext *dc, itemDef_s *item)
 {
+#ifdef KISAK_NX
+    if ( dc->openMenuCount && item && item->dvar && !I_stricmp(item->dvar, "r_vsync") )
+    {
+        Dvar_SetFromStringByName("ui_r_vsync", Dvar_GetBool("r_vsync") ? (char *)"1" : (char *)"0");
+        UI_PlaySound(dc->contextIndex, (char *)"uin_mouse_click_t");
+        return;
+    }
+#endif
     if ( dc->openMenuCount )
     {
         if ( item )
@@ -9587,7 +9608,6 @@ void __cdecl Item_Multi_Paint(int localClientNum, UiContext *dc, itemDef_s *item
 
 const char *__cdecl Item_Multi_Setting(itemDef_s *item)
 {
-    const char *VariantString; // eax
     multiDef_s *multiPtr; // [esp+0h] [ebp-10h]
     const char *string; // [esp+4h] [ebp-Ch]
     int i; // [esp+8h] [ebp-8h]
@@ -9608,13 +9628,16 @@ const char *__cdecl Item_Multi_Setting(itemDef_s *item)
     }
     else
     {
-        VariantString = Dvar_GetVariantString(item->dvar);
-        value = atof(VariantString);
+        value = Item_Multi_GetFloatValue(item);
         for ( ia = 0; ia < multiPtr->count; ++ia )
         {
             if ( multiPtr->dvarValue[ia] == value )
                 return multiPtr->dvarList[ia];
         }
+#ifdef KISAK_NX
+        if ( item->dvar && !I_stricmp(item->dvar, "nx_fpsLimit") )
+            return va("%d FPS", (int)value);
+#endif
     }
     return "";
 }
@@ -11416,6 +11439,8 @@ bool UI_NX_IsHiddenAimAssistHighlight(int contextIndex, const itemDef_s *item)
         choice = "options_gamepad_nx_aimaccel";
     else if ( !I_stricmp(item->window.name, "options_graphics_performance_hl") )
         choice = "options_graphics_performance";
+    else if ( !I_stricmp(item->window.name, "options_graphics_frame_limit_hl") )
+        choice = "options_graphics_frame_limit";
     else if ( !I_stricmp(item->window.name, "openblops_host_maxplayers_hl") )
         choice = "openblops_host_maxplayers";
     else
@@ -11601,33 +11626,24 @@ static void UI_NX_AddAimAssistOption(menuDef_t *menu)
                             invert->window.rect.vertAlign);
 }
 
-// Graphics is supplied by three zones (SP, MP frontend, MP in-game). Clone
-// the native shadow toggle's layers so mouse, keyboard and pad use the usual
-// multi-choice control without modifying the supplied zone files.
-static void UI_AddPerformanceOverlayOption(menuDef_t *menu)
+static bool UI_AddGraphicsChoiceRow(menuDef_t *menu, const itemDef_s *after, float rowY,
+    const char *name, const char *highlightName, const char *rowName, const char *labelText,
+    const char *dvar, multiDef_s *values)
 {
-    if ( !menu || !menu->window.name || I_stricmp(menu->window.name, "options_graphics") )
-        return;
-    _Dvar_RegisterBool("cg_performanceOverlay", false, 1u /* archive */, "Show FPS and performance statistics");
-    if ( UI_NX_FindItem(menu, "options_graphics_performance", nullptr) )
-        return;
-    itemDef_s *source = UI_NX_FindItemByDvar(menu, "sm_enable");
-    itemDef_s *last = UI_NX_FindItemByDvar(menu, "cg_fov_default");
-    if ( !source || !last || !source->window.name )
-        return;
+    const itemDef_s *source = UI_NX_FindItemByDvar(menu, "sm_enable");
+    if ( !source || !after || !source->window.name )
+        return false;
     const itemDef_s *label = nullptr;
     int lastIndex = -1, sourceIndex = -1;
     for ( int i = 0; i < menu->itemCount; ++i )
     {
         itemDef_s *item = menu->items[i];
-        if ( item == last ) lastIndex = i;
+        if ( item == after ) lastIndex = i;
         if ( item == source ) sourceIndex = i;
         if ( item != source && UI_NX_ItemNamed(item, source->window.name) && Item_IsTextDefType(item) )
             label = item;
     }
-    if ( !label || lastIndex < 0 || sourceIndex < 0 ) return;
-    static multiDef_s values = { { "@MENU_OFF", "@MENU_ON" }, {}, { 0.0f, 1.0f }, 2, 0, 0 };
-    const float rowY = last->window.rect.y + 19.0f;
+    if ( !label || lastIndex < 0 || sourceIndex < 0 ) return false;
     itemDef_s *added[8] = {};
     int count = 0;
     for ( int i = 0; i <= sourceIndex && count < (int)ARRAY_COUNT(added); ++i )
@@ -11639,10 +11655,10 @@ static void UI_AddPerformanceOverlayOption(menuDef_t *menu)
             && src->window.rect.h == label->window.rect.h;
         if ( !choice && !layer ) continue;
         const bool highlight = !choice && src->visibleExp.numRpn != source->visibleExp.numRpn;
-        itemDef_s *copy = UI_NX_CloneItem(menu, src, choice ? "options_graphics_performance"
-            : highlight ? "options_graphics_performance_hl" : "options_graphics_performance_row",
+        itemDef_s *copy = UI_NX_CloneItem(menu, src, choice ? name
+            : highlight ? highlightName : rowName,
             rowY - source->window.rect.y, choice);
-        if ( !copy ) return;
+        if ( !copy ) return false;
         copy->visibleExp = {};
         copy->showBits = 0;
         copy->hideBits = ~0ULL;
@@ -11652,39 +11668,132 @@ static void UI_AddPerformanceOverlayOption(menuDef_t *menu)
         if ( Item_IsTextDefType(copy) && copy->typeData.textDef )
         {
             copy->typeData.textDef->textExpData = nullptr;
-            copy->typeData.textDef->text = choice ? nullptr : "PERFORMANCE OVERLAY";
+            copy->typeData.textDef->text = choice ? nullptr : labelText;
         }
         if ( choice )
         {
             focusItemDef_s *focus = (focusItemDef_s *)calloc(1, sizeof(focusItemDef_s));
-            if ( !focus ) return;
-            focus->focusTypeData.multi = &values;
+            if ( !focus ) return false;
+            focus->focusTypeData.multi = values;
             copy->typeData.textDef->textTypeData.focusItemDef = focus;
-            copy->dvar = "cg_performanceOverlay";
+            copy->dvar = dvar;
         }
         added[count++] = copy;
     }
-    if ( !count ) return;
+    if ( !count ) return false;
     itemDef_s **items = (itemDef_s **)malloc((menu->itemCount + count) * sizeof(itemDef_s *));
-    if ( !items ) return;
+    if ( !items ) return false;
     memcpy(items, menu->items, (lastIndex + 1) * sizeof(itemDef_s *));
     memcpy(items + lastIndex + 1, added, count * sizeof(itemDef_s *));
     memcpy(items + lastIndex + 1 + count, menu->items + lastIndex + 1,
         (menu->itemCount - lastIndex - 1) * sizeof(itemDef_s *));
-    // SP/common_mp have one extra graphics row. Keep Back/Apply below the
-    // new control, including their focus animation destinations and actions.
+    menu->items = items;
+    menu->itemCount += count;
+    return true;
+}
+
+static void UI_AddPerformanceOverlayOption(menuDef_t *menu)
+{
+    if ( !menu || !menu->window.name || I_stricmp(menu->window.name, "options_graphics") )
+        return;
+    _Dvar_RegisterBool("cg_performanceOverlay", false, 1u /* archive */, "Show FPS and performance statistics");
+    if ( UI_NX_FindItem(menu, "options_graphics_performance", nullptr) )
+        return;
+    const itemDef_s *last = UI_NX_FindItemByDvar(menu, "cg_fov_default");
+    if ( !last ) return;
+    static multiDef_s values = { { "@MENU_OFF", "@MENU_ON" }, {}, { 0.0f, 1.0f }, 2, 0, 0 };
+    const float rowY = last->window.rect.y + 19.0f;
+    if ( !UI_AddGraphicsChoiceRow(menu, last, rowY, "options_graphics_performance",
+            "options_graphics_performance_hl", "options_graphics_performance_row",
+            "PERFORMANCE OVERLAY", "cg_performanceOverlay", &values) )
+        return;
     for ( int i = 0; i < menu->itemCount; ++i )
     {
         itemDef_s *item = menu->items[i];
         if ( !Item_IsTextDefType(item) || !item->typeData.textDef ) continue;
         const char *text = item->typeData.textDef->text;
         if ( !text || (I_stricmp(text, "@PLATFORM_BACK") && I_stricmp(text, "@MENU_APPLY")) ) continue;
-        const float dy = rowY + source->window.rect.h + 5.0f - item->window.rect.y;
+        const float dy = rowY + last->window.rect.h + 5.0f - item->window.rect.y;
         if ( dy > 0 ) UI_NX_MoveItem(item, dy);
     }
-    menu->items = items;
-    menu->itemCount += count;
 }
+
+#ifdef KISAK_NX
+struct FrameRateOptionText
+{
+    const char *language;
+    const char *label;
+    const char *unlimited;
+};
+
+static const FrameRateOptionText &UI_NX_GetFrameRateOptionText()
+{
+    static constexpr FrameRateOptionText translations[] = {
+        { "english",   "FPS LIMIT", "UNLIMITED" },
+        { "french",    "LIMITE FPS", "SANS LIMITE" },
+        { "frenchcan", "LIMITE FPS", "SANS LIMITE" },
+        { "german",    "FPS-LIMIT", "UNBEGRENZT" },
+        { "austrian",  "FPS-LIMIT", "UNBEGRENZT" },
+        { "italian",   "LIMITE FPS", "ILLIMITATO" },
+        { "spanish",   "L\xCDMITE DE FPS", "SIN L\xCDMITE" },
+        { "british",   "FPS LIMIT", "UNLIMITED" },
+        { "russian",   "\xCB\xC8\xCC\xC8\xD2 FPS", "\xC1\xC5\xC7 \xCB\xC8\xCC\xC8\xD2\xC0" },
+        { "polish",    "LIMIT FPS", "BEZ LIMITU" },
+        { "korean",    "FPS \xC1\xA6\xC7\xD1", "\xC1\xA6\xC7\xD1 \xBE\xF8\xC0\xBD" },
+        { "japanese",  "FPS \x8F\xE3\x8C\xC0", "\x96\xB3\x90\xA7\x8C\xC0" },
+        { "czech",     "LIMIT FPS", "BEZ OMEZEN\xCD" },
+        { "fulljap",   "FPS \x8F\xE3\x8C\xC0", "\x96\xB3\x90\xA7\x8C\xC0" },
+    };
+    const char *language = SEH_GetLanguageName(SEH_GetCurrentLanguage());
+    for ( const auto &translation : translations )
+        if ( !I_stricmp(language, translation.language) )
+            return translation;
+    return translations[0];
+}
+
+static void UI_NX_AddFrameRateOption(menuDef_t *menu)
+{
+    if ( !menu || !menu->window.name || I_stricmp(menu->window.name, "options_graphics")
+        || UI_NX_FindItem(menu, "options_graphics_frame_limit", nullptr) )
+        return;
+    itemDef_s *vsync = UI_NX_FindItemByDvar(menu, "r_vsync");
+    if ( !vsync )
+    {
+        vsync = UI_NX_FindItemByDvar(menu, "ui_r_vsync");
+        if ( vsync )
+            vsync->dvar = "r_vsync";
+    }
+    const itemDef_s *filter = UI_NX_FindItemByDvar(menu, "r_texFilterMipMode");
+    const itemDef_s *textures = UI_NX_FindItemByDvar(menu, "ui_r_picmip");
+    if ( !vsync || !filter || !textures )
+        return;
+
+    static multiDef_s values = {
+        { "30 FPS", "40 FPS", "45 FPS", "50 FPS", "60 FPS", "75 FPS", "85 FPS", "90 FPS", "120 FPS", "UNLIMITED" },
+        {}, { 30, 40, 45, 50, 60, 75, 85, 90, 120, 0 }, 10, 0, 0
+    };
+    const auto &translation = UI_NX_GetFrameRateOptionText();
+    values.dvarList[values.count - 1] = translation.unlimited;
+    const float rowY = vsync->window.rect.y + 19.0f;
+    const float firstY = filter->window.rect.y - 1.0f;
+    const float lastY = textures->window.rect.y;
+    const float shift = rowY + 19.0f - filter->window.rect.y;
+    if ( !UI_AddGraphicsChoiceRow(menu, vsync, rowY, "options_graphics_frame_limit",
+            "options_graphics_frame_limit_hl", "options_graphics_frame_limit_row",
+            translation.label, "nx_fpsLimit", &values) )
+        return;
+
+    if ( shift > 0.0f )
+        for ( int i = 0; i < menu->itemCount; ++i )
+        {
+            itemDef_s *item = menu->items[i];
+            if ( !item ) continue;
+            const rectDef_s &rect = item->window.rect;
+            if ( rect.x >= filter->window.rect.x && rect.y >= firstY && rect.y <= lastY )
+                UI_NX_MoveItem(item, shift);
+        }
+}
+#endif
 
 void __cdecl UI_AddMenu(int localClientNum, UiContext *dc, menuDef_t *menu, int close)
 {
@@ -11692,6 +11801,9 @@ void __cdecl UI_AddMenu(int localClientNum, UiContext *dc, menuDef_t *menu, int 
 
     UI_NX_AddAimAssistOption(menu);
     UI_AddPerformanceOverlayOption(menu);
+#ifdef KISAK_NX
+    UI_NX_AddFrameRateOption(menu);
+#endif
     for ( i = 0; i < dc->menuCount; ++i )
     {
         if ( dc->Menus[i] == menu )

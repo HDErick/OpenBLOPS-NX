@@ -4,6 +4,7 @@
 #endif
 #ifdef KISAK_NX
 #include <nx/nx_stall_scope.h>
+#include <atomic>
 #endif
 #include <gfx_d3d/r_font.h>
 #include "rb_stats.h"
@@ -4808,6 +4809,15 @@ void __cdecl RB_EndFrame(char drawType)
     }
 }
 
+#ifdef KISAK_NX
+static std::atomic<bool> rb_vsync{false};
+
+void RB_SetVSync(bool enabled)
+{
+    rb_vsync.store(enabled, std::memory_order_relaxed);
+}
+#endif
+
 void RB_SwapBuffers()
 {
     unsigned __int8 stereoActivated; // [esp+2Fh] [ebp-2Dh] BYREF
@@ -4827,11 +4837,16 @@ void RB_SwapBuffers()
 #endif
         PROF_SCOPED("Present()");
 
+        DWORD presentFlags = 0;
+#ifdef KISAK_NX
+        if (!rb_vsync.load(std::memory_order_relaxed))
+            presentFlags = D3DPRESENT_FORCEIMMEDIATE;
+#endif
         if (rg.renderHiResShot || dx.resizeWindow)
             hr = 0;
         else
         {
-            hr = dx.windows[dx.targetWindowIndex].swapChain->Present(0, 0, 0, 0, 0);
+            hr = dx.windows[dx.targetWindowIndex].swapChain->Present(0, 0, 0, 0, presentFlags);
 #ifdef NX_DXVK
             if (hr == D3D_OK)
                 NX_SaltyNXFrame(vidConfig.sceneWidth, vidConfig.sceneHeight);

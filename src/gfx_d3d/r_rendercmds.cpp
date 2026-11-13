@@ -2008,6 +2008,9 @@ void R_UpdateFrontEndDvarOptions()
     GfxImage *image; // [esp+4h] [ebp-Ch]
 
     PROF_SCOPED("R_UpdateFrontEndDvarOptions"); // LWSS ADD
+#ifdef KISAK_NX
+    RB_SetVSync(r_vsync->current.enabled);
+#endif
 
     if (R_LightTweaksModified())
         R_UpdateLightsFromDvars();

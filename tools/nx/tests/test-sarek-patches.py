@@ -18,6 +18,10 @@ for name in ['meson.build',*paths]:
     target.parent.mkdir(parents=True,exist_ok=True)
     target.write_bytes(subprocess.check_output(['git','-C',str(source),'show',f'HEAD:{name}']))
 subprocess.run([sys.executable,str(patch),str(replay)],check=True)
+swapchain=(replay/'src/d3d9/d3d9_swapchain.cpp').read_text()
+recreate=swapchain.split('void D3D9SwapChainEx::RecreateSwapChain(',1)[1].split('void D3D9SwapChainEx::CreatePresenter(',1)[0]
+assert 'PickPresentModes(false, presenterDesc.presentModes)' in recreate
+assert 'vsync != m_vsync' not in swapchain
 for name in paths:
     assert (source/name).read_text()==(replay/name).read_text(), f'Unreproducible patch: {name}'
 first={name:hashlib.sha256((replay/name).read_bytes()).hexdigest() for name in paths}
