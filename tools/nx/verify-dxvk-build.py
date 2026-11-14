@@ -40,7 +40,9 @@ label = 'DXVK Sarek 1.14.1 0c0e8f6'
 assert label.encode() in binary, 'Renderer build label missing from NRO'
 assert b'dxvk-sarek.conf' in binary and b'dxvk-sarek-1.14.1' in binary
 assert not b'DXVK 3.1.1 b1a1c99' in binary, 'Wrong native backend linked'
-report={'name':args.name,'architecture':'AArch64','renderer':f'Native {label} -> NVK 26.2.3',
+assert b'Mesa 26.2.7' in binary, 'Wrong Mesa driver linked'
+assert b'nvk-26.2.7' in binary, 'Missing Mesa 26.2.7 cache directory'
+report={'name':args.name,'architecture':'AArch64','renderer':f'Native {label} -> NVK 26.2.7',
         'nro_bytes':len(binary),'nro_sha256':hashlib.sha256(binary).hexdigest(),
         'elf_sha256':hashlib.sha256(elf_data).hexdigest(),'nro_segments':segments,
         'native_linkage_checked':True,'hardware_tested':False}

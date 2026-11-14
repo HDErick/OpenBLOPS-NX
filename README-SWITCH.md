@@ -91,8 +91,10 @@ Text fields (server name, passwords) open the Switch keyboard.
 
 ## Building
 
-devkitPro (devkitA64, libnx) under its MSYS2 shell, with the pinned Mesa and
-DXVK dependencies prepared in `build-nx/deps/`:
+Use devkitPro (devkitA64, libnx) under its MSYS2 shell. Run
+`tools/nx/prepare-dxvk.py` with the pinned Mesa 26.2.7 archive and DXVK COM header
+checkout, then run `python3 tools/nx/prepare-sarek.py` to prepare DXVK Sarek
+1.14.1 in `build-nx/deps/`. Build both executables with:
 
 ```sh
 sh tools/nx/build-sarek.sh

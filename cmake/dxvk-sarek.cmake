@@ -9,7 +9,7 @@ set(NX_DXVK_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/dxvk-generated")
 file(MAKE_DIRECTORY "${NX_DXVK_GENERATED}")
 file(WRITE "${NX_DXVK_GENERATED}/version.h" "#define DXVK_VERSION \"1.14.1-kisak-horizon\"\n")
 file(WRITE "${NX_DXVK_GENERATED}/nx_renderer_build.h"
-    "#define NX_RENDERER_LABEL \"DXVK Sarek 1.14.1 0c0e8f6\"\n#define NX_RENDERER_CACHE \"dxvk-sarek-1.14.1\"\n#define NX_RENDERER_CONFIG \"dxvk-sarek.conf\"\n")
+    "#define NX_RENDERER_LABEL \"DXVK Sarek 1.14.1 0c0e8f6\"\n#define NX_RENDERER_CACHE \"dxvk-sarek-1.14.1\"\n#define NX_RENDERER_CONFIG \"dxvk-sarek.conf\"\n#define NX_MESA_VERSION \"26.2.7\"\n")
 set(NX_SAREK_SOURCES)
 foreach(part util spirv vulkan dxvk dxso d3d9)
     file(READ "${NX_DXVK_SOURCE}/src/${part}/meson.build" manifest)

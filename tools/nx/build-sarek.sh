@@ -21,6 +21,8 @@ for mode in sp mp; do
     -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
     -DCMAKE_BUILD_TYPE=Release -DNX_SP="$sp" -DNX_DXVK=ON \
     -DKISAK_DIRECT_CONNECT=ON -DOPENBLOPS_NX_OUTPUT_DIR="$output" \
+    -DNX_MESA_SDK="$PWD/build-nx/deps/mesa-26.2.7/opt/devkitpro/portlibs/switch" \
+    -U Vulkan_DIR -U Vulkan_LIBRARY -U Vulkan_INCLUDE_DIR \
     -DNX_DXVK_PREBUILT_DIR="$native"
   cmake --build "$build" -j "$jobs"
 done

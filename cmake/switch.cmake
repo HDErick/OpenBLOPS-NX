@@ -215,8 +215,8 @@ endif()
 target_include_directories(${BIN_NAME} PUBLIC "${NX_PORTLIBS}/include")
 target_link_libraries(${BIN_NAME} PRIVATE "${NX_PORTLIBS}/lib/libzstd.a")
 if(NX_DXVK)
-    set(NX_MESA_SDK "${CMAKE_SOURCE_DIR}/build-nx/deps/mesa/opt/devkitpro/portlibs/switch"
-        CACHE PATH "Unified Horizon Mesa 26.2.3 SDK")
+    set(NX_MESA_SDK "${CMAKE_SOURCE_DIR}/build-nx/deps/mesa-26.2.7/opt/devkitpro/portlibs/switch"
+        CACHE PATH "Unified Horizon Mesa 26.2.7 SDK")
     set(NX_DXVK_PREBUILT_DIR "" CACHE PATH "Optional native DXVK build shared by SP and MP")
     if(NX_DXVK_PREBUILT_DIR)
         add_library(nx_dxvk_native STATIC IMPORTED)
@@ -231,7 +231,7 @@ if(NX_DXVK)
     target_link_libraries(${BIN_NAME} PRIVATE nx_d3d9_bridge Vulkan::Vulkan)
     target_link_options(${BIN_NAME} PRIVATE -Wl,--wrap=pthread_create -Wl,-u,__wrap_pthread_create)
     target_link_options(${BIN_NAME} PRIVATE "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/${NX_NRO_NAME}.map")
-    message(STATUS "Renderer: native ARM64 DXVK (Sarek) -> NVK 26.2.3")
+    message(STATUS "Renderer: native ARM64 DXVK (Sarek) -> NVK ${Vulkan_VERSION}")
 else()
 # ----- Mesa EGL / OpenGL -----
 # For src/nx/nx_d3d9_null.cpp's Clear and Present. Nothing else uses GL yet.

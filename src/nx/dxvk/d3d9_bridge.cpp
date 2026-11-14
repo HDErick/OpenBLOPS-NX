@@ -207,7 +207,7 @@ ULONG IUnknown9Like::Release() {
 }
 
 IDirect3D9* Direct3DCreate9(UINT sdkVersion) {
-    std::printf("[nx-dxvk] %s, native ARM64, NVK 26.2.3, VK_NN_vi_surface\n", NX_RENDERER_LABEL);
+    std::printf("[nx-dxvk] %s, native ARM64, NVK " NX_MESA_VERSION ", VK_NN_vi_surface\n", NX_RENDERER_LABEL);
     ::IDirect3D9* native=nullptr;
     try { native=::Direct3DCreate9(sdkVersion); }
     catch (const std::exception& error) {
@@ -240,13 +240,13 @@ extern "C" void NX_DxvkConfigure(const char* executable) {
     NX_DxvkInitThreadAffinity();
     mkdir(NX_GAME_DIR "/shadercache", 0777);
     mkdir(NX_GAME_DIR "/shadercache/" NX_RENDERER_CACHE, 0777);
-    mkdir(NX_GAME_DIR "/shadercache/nvk-26.2.3", 0777);
+    mkdir(NX_GAME_DIR "/shadercache/nvk-" NX_MESA_VERSION, 0777);
     setenv("NX_DXVK_EXE_PATH", executable, 1);
     // stderr uses the game's asynchronous SD log.
     setenv("DXVK_LOG_PATH", "none", 1);
     setenv("DXVK_SHADER_CACHE_PATH", NX_GAME_DIR "/shadercache/" NX_RENDERER_CACHE, 1);
     setenv("DXVK_STATE_CACHE_PATH", NX_GAME_DIR "/shadercache/" NX_RENDERER_CACHE, 1);
-    setenv("MESA_SHADER_CACHE_DIR", NX_GAME_DIR "/shadercache/nvk-26.2.3", 1);
+    setenv("MESA_SHADER_CACHE_DIR", NX_GAME_DIR "/shadercache/nvk-" NX_MESA_VERSION, 1);
     setenv("MESA_SHADER_CACHE_MAX_SIZE", "256M", 0);
     setenv("DXVK_CONFIG_FILE", NX_GAME_DIR "/" NX_RENDERER_CONFIG, 1);
     // Defaults for installations without a config file.
