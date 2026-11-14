@@ -860,8 +860,8 @@ void __cdecl R_RegisterDvars()
     r_showLightingOrigins = _Dvar_RegisterBool("r_showLightingOrigins", 0, 0x80u, "Show lighting origins for models");
     r_showMissingLightGrid = _Dvar_RegisterBool(
                                                          "r_showMissingLightGrid",
-                                                         1,
                                                          0,
+                                                         0x80u,
                                                          "Use rainbow colors for entities that are outside the light grid");
     r_cacheSModelLighting = _Dvar_RegisterBool(
                                                         "r_cacheSModelLighting",
