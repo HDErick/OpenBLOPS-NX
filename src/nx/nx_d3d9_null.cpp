@@ -40,6 +40,7 @@
 
 #include "nx_d3d9_shader.h"
 #include "nx_clock.h"
+#include "nx_saltynx.h"
 #include <universal/profile.h>
 
 #include <map>
@@ -6104,6 +6105,8 @@ HRESULT IDirect3DSwapChain9::Present(const RECT *, const RECT *, HWND, const voi
         NxProfScope prof(NXP_SWAP);
         swapped = eglSwapBuffers(s_display, s_surface);
     }
+    if (swapped && blitted)
+        NX_SaltyNXFrame(bb->width, bb->height);
     EGLint eglErr = eglGetError();
     GLenum errAfterSwap = report ? glGetError() : GL_NO_ERROR;
     nxGlGpuTimerBegin();

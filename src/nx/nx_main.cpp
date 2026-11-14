@@ -7,6 +7,7 @@
 #include "nx_load_boost.h"
 #include "nx_kbz.h"
 #include "nx_bink_audio.h"
+#include "nx_saltynx.h"
 #include <universal/local_player_name.h>
 #include <universal/profile.h>
 
@@ -760,6 +761,7 @@ extern "C" void NX_PrepareExit(void)
     if (R_SUCCEEDED(threadCreate(&s_exitWatchdog, nxExitWatchdog, nullptr, nullptr, 0x4000, 0x2B, -2))
         && R_SUCCEEDED(threadStart(&s_exitWatchdog)))
         s_exitWatchdogRunning = true;
+    NX_SaltyNXStop();
     NX_LoadBoostExit();
     nxExitStep("SD_Shutdown");
     SD_Shutdown();
@@ -833,6 +835,7 @@ int main(int argc, char **argv)
 
     // Keep the applet alive while the game runs its own main loop.
     appletLockExit();
+    NX_SaltyNXStart();
 
     socketInitializeDefault();
 
@@ -841,6 +844,7 @@ int main(int argc, char **argv)
     socketInitializeDefault();
     atexit([]{ nxExitStep("atexit: socketExit (1)"); socketExit(); });
     atexit([]{ nxExitStep("atexit: appletUnlockExit"); appletUnlockExit(); });
+    atexit(NX_SaltyNXStop);
     chdir(NX_GAME_DIR);
 
     nxSetupLogging();

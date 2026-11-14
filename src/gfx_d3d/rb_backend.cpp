@@ -1,4 +1,7 @@
 #include "rb_backend.h"
+#ifdef NX_DXVK
+#include <nx/nx_saltynx.h>
+#endif
 #ifdef KISAK_NX
 #include <nx/nx_stall_scope.h>
 #endif
@@ -4827,7 +4830,13 @@ void RB_SwapBuffers()
         if (rg.renderHiResShot || dx.resizeWindow)
             hr = 0;
         else
+        {
             hr = dx.windows[dx.targetWindowIndex].swapChain->Present(0, 0, 0, 0, 0);
+#ifdef NX_DXVK
+            if (hr == D3D_OK)
+                NX_SaltyNXFrame(vidConfig.sceneWidth, vidConfig.sceneHeight);
+#endif
+        }
     }
 
     FrameMark; // backend thread Frame marker
