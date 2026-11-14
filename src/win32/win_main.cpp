@@ -427,8 +427,6 @@ void __cdecl Sys_LoadingKeepAlive()
 }
 
 #ifdef KISAK_NX
-#include <nx/nx_clock.h>
-static const dvar_t *s_nxGpuClock;
 extern "C" bool NX_PumpAppletMessages(void); // nx_main.cpp: true once HOME asks the title to close
 #endif
 
@@ -448,8 +446,6 @@ sysEvent_t *__cdecl Win_GetEvent(sysEvent_t *result)
 #ifdef KISAK_NX
         if ( NX_PumpAppletMessages() )
             Com_Quit_f();
-        if (s_nxGpuClock)
-            NX_ClockUpdate(s_nxGpuClock->current.integer);
 #endif
 
         if (IsDedicatedServer())
@@ -1004,10 +1000,6 @@ int __stdcall WinMain(HINSTANCE__ *hInstance, HINSTANCE__ *hPrevInstance, char *
         {
             Com_InitParse();
             Dvar_Init();
-#ifdef KISAK_NX
-            s_nxGpuClock = _Dvar_RegisterInt("nx_gpuclock", 460, 0, 460, 0,
-                "Handheld GPU clock in MHz: 307, 384 or 460; 0 restores the system clock");
-#endif
             InitTiming();
             Sys_FindInfo();
             g_wv.hInstance = hInstance;

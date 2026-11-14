@@ -39,7 +39,6 @@
 #include <qcommon/threads.h>
 
 #include "nx_d3d9_shader.h"
-#include "nx_clock.h"
 #include "nx_saltynx.h"
 #include <universal/profile.h>
 

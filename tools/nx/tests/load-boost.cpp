@@ -27,6 +27,7 @@ void appletHook(AppletHookCookie *, AppletHookFn fn, void *) { callback = fn; }
 void appletUnhook(AppletHookCookie *) { callback = nullptr; }
 u64 armGetSystemTick() { return now; }
 u64 armTicksToNs(u64 ticks) { return ticks; }
+bool DB_FinishedLoadingAssets() { return false; }
 
 static void check(bool condition, const char *message)
 {

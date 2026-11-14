@@ -35,7 +35,7 @@ void applyBoost(const char *reason, bool force = false)
     Result rc = appletSetCpuBoostMode(wanted ? ApmCpuBoostMode_FastLoad : ApmCpuBoostMode_Normal);
     if (R_FAILED(rc))
     {
-        std::printf("[nx-clock] CPU boost %s failed: %08x (%s)\n",
+        std::printf("[nx-load-boost] CPU boost %s failed: %08x (%s)\n",
                     wanted ? "enable" : "restore", unsigned(rc), reason);
         if (wanted && !s_active.load())
             s_supported = false;
@@ -46,7 +46,7 @@ void applyBoost(const char *reason, bool force = false)
 
     s_active = wanted;
     s_retryPending = false;
-    std::printf("[nx-clock] CPU boost %s (%s; phases=%u)\n",
+    std::printf("[nx-load-boost] CPU boost %s (%s; phases=%u)\n",
                 wanted ? "on" : "off", reason, s_phases);
 }
 
@@ -70,19 +70,12 @@ void NX_LoadBoostInit()
     s_phases = unsigned(NxLoadPhase::Boot);
     if (!s_supported)
     {
-        std::printf("[nx-clock] CPU loading boost requires Horizon 7.0.0 or later\n");
+        std::printf("[nx-load-boost] CPU loading boost requires Horizon 7.0.0 or later\n");
         return;
     }
     appletHook(&s_hook, appletHookCallback, nullptr);
     s_hooked = true;
     applyBoost("boot");
-}
-
-void NX_LoadBoostRunGpuClockUpdate(void (*update)(int), int handheldMhz)
-{
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (!s_active.load())
-        update(handheldMhz);
 }
 
 void NX_LoadBoostSet(NxLoadPhase phase, bool active)

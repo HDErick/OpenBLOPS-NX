@@ -2,7 +2,6 @@
 // sets up the game directory, then hands control to the game's WinMain
 // (src/win32/win_main.cpp), which never returns.
 #include <switch.h>
-#include "nx_clock.h"
 #include "nx_install.h"
 #include "nx_load_boost.h"
 #include "nx_kbz.h"
@@ -24,6 +23,13 @@
 
 extern "C" void nx_wincompat_init_main_thread(void);
 extern "C" void nx_set_command_line(const char *cmdline);
+
+extern "C"
+{
+// libnx requests this APM profile at startup for normal (handheld) mode.
+// CPU 1020 MHz, GPU 460.8 MHz, EMC 1331.2 MHz. HOS selects the docked profile.
+u32 __nx_applet_PerformanceConfiguration[2] = {0x92220008, 0};
+}
 
 static char s_installDir[512] = NX_GAME_DIR;
 
@@ -852,8 +858,6 @@ int main(int argc, char **argv)
 #ifdef NX_DXVK
     NX_DxvkConfigure(s_nroPath[0] ? s_nroPath : NX_GAME_DIR "/" NX_GAME_NRO);
 #endif
-    NX_ClockInit();
-    atexit([]{ nxExitStep("atexit: NX_ClockExit"); NX_ClockExit(); });
     NX_LoadBoostInit();
     NX_BinkInitClock();
     atexit(NX_LoadBoostExit);

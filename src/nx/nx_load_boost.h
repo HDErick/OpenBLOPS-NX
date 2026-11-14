@@ -15,4 +15,3 @@ void NX_LoadBoostEndBootWhenLoaded();
 bool NX_LoadBoostBackgroundLoading();
 void NX_LoadBoostExit();
 bool NX_LoadBoostActive();
-void NX_LoadBoostRunGpuClockUpdate(void (*update)(int), int handheldMhz);

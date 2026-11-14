@@ -30,7 +30,7 @@ required=['nvk_loaderless_GetInstanceProcAddr','dxvk::D3D9DeviceEx::DrawIndexedP
           'kisak_d3d9::IDirect3DDevice9::DrawIndexedPrimitive','NX_DxvkConfigure',
           '__wrap_pthread_create','NX_DxvkReportCounters']
 required += ['NX_SarekCreateSurface', 'dxvk::DxsoModule::compile']
-required += ['NX_SaltyNXFrame']
+required += ['__nx_applet_PerformanceConfiguration', 'NX_SaltyNXFrame']
 for symbol in required:
     assert symbol in symbols, f'Missing native renderer symbol: {symbol}'
 for forbidden in ('eglCreateContext','eglSwapBuffers','glDrawElements','zink_create_screen','NX_GlRelease'):
