@@ -1,8 +1,8 @@
-"""Idempotent Horizon changes for Sarek 1.13.0 (37f397e142b977a343e920dbc4c7bf7ed2c63a81)."""
+"""Idempotent Horizon changes for Sarek 1.14.1 (0c0e8f6f62c7cb37dbf5d38413517efa00c08fef)."""
 from pathlib import Path
 import sys
 source=Path(sys.argv[1])
-assert "version : 'v1.13.0'" in (source/'meson.build').read_text()
+assert "version : 'v1.14.1'" in (source/'meson.build').read_text()
 def replace(path,before,after):
     file=source/path
     content=file.read_text()
@@ -17,21 +17,9 @@ replace('src/vulkan/vulkan_loader.cpp', '''  : m_library(LoadLibraryA("vulkan-1"
   , m_getInstanceProcAddr(reinterpret_cast<PFN_vkGetInstanceProcAddr>(
         GetProcAddress(m_library, "vkGetInstanceProcAddr"))) {''',
     '''  : m_library(nullptr), m_getInstanceProcAddr(nvk_loaderless_GetInstanceProcAddr) {''')
-replace('src/vulkan/vulkan_presenter.cpp', '''    HINSTANCE instance = reinterpret_cast<HINSTANCE>(
-      GetWindowLongPtr(m_window, GWLP_HINSTANCE));
-
-    VkWin32SurfaceCreateInfoKHR info;
-    info.sType      = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-    info.pNext      = nullptr;
-    info.flags      = 0;
-    info.hinstance  = instance;
-    info.hwnd       = m_window;
-
-    VkResult status = m_vki->vkCreateWin32SurfaceKHR(
-      m_vki->instance(), &info, nullptr, &m_surface);''',
-    '''    VkResult status = NX_SarekCreateSurface(m_vki->instance(), &m_surface);''')
 replace('src/dxvk/platform/dxvk_win32_exts.cpp','"Win32 WSI"','"Horizon WSI"')
-replace('src/dxvk/platform/dxvk_win32_exts.cpp','VK_KHR_WIN32_SURFACE_EXTENSION_NAME','VK_NN_VI_SURFACE_EXTENSION_NAME')
+replace('src/dxvk/platform/dxvk_win32_exts.cpp','    names.add(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);',
+    '    names.add(VK_NN_VI_SURFACE_EXTENSION_NAME);')
 replace('src/dxvk/dxvk_instance.cpp', '''    m_extProviders.push_back(&VrInstance::s_instance);
     m_extProviders.push_back(&DxvkXrProvider::s_instance);''',
     '')

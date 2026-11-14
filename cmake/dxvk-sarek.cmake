@@ -1,5 +1,5 @@
 get_filename_component(NX_PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
-set(NX_DXVK_SOURCE "${NX_PROJECT_ROOT}/build-nx/deps/dxvk-sarek" CACHE PATH "Pinned DXVK Sarek 1.13.0 source")
+set(NX_DXVK_SOURCE "${NX_PROJECT_ROOT}/build-nx/deps/dxvk-sarek-1.14.1" CACHE PATH "Pinned DXVK Sarek 1.14.1 source")
 set(NX_DXVK_NATIVE_HEADERS "${NX_PROJECT_ROOT}/build-nx/deps/dxvk/include/native" CACHE PATH "DXVK 3.1.1 portable COM declarations")
 find_program(NX_HOST_PYTHON python3 HINTS /usr/bin NO_CMAKE_FIND_ROOT_PATH REQUIRED)
 find_program(NX_GLSLANG glslangValidator HINTS /ucrt64/bin NO_CMAKE_FIND_ROOT_PATH REQUIRED)
@@ -7,9 +7,9 @@ execute_process(COMMAND "${NX_HOST_PYTHON}" "${NX_PROJECT_ROOT}/tools/nx/patch-d
     COMMAND_ERROR_IS_FATAL ANY)
 set(NX_DXVK_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/dxvk-generated")
 file(MAKE_DIRECTORY "${NX_DXVK_GENERATED}")
-file(WRITE "${NX_DXVK_GENERATED}/version.h" "#define DXVK_VERSION \"1.13.0-kisak-horizon\"\n")
+file(WRITE "${NX_DXVK_GENERATED}/version.h" "#define DXVK_VERSION \"1.14.1-kisak-horizon\"\n")
 file(WRITE "${NX_DXVK_GENERATED}/nx_renderer_build.h"
-    "#define NX_RENDERER_LABEL \"DXVK Sarek 1.13.0 37f397e\"\n#define NX_RENDERER_CACHE \"dxvk-sarek-1.13.0\"\n#define NX_RENDERER_CONFIG \"dxvk-sarek.conf\"\n")
+    "#define NX_RENDERER_LABEL \"DXVK Sarek 1.14.1 0c0e8f6\"\n#define NX_RENDERER_CACHE \"dxvk-sarek-1.14.1\"\n#define NX_RENDERER_CONFIG \"dxvk-sarek.conf\"\n")
 set(NX_SAREK_SOURCES)
 foreach(part util spirv vulkan dxvk dxso d3d9)
     file(READ "${NX_DXVK_SOURCE}/src/${part}/meson.build" manifest)

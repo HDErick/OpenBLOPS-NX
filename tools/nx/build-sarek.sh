@@ -11,7 +11,7 @@ native="$output/renderer"
 cmake -S tools/nx/dxvk -B "$native" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
-  -DNX_DXVK_SOURCE="$PWD/build-nx/deps/dxvk-sarek"
+  -DNX_DXVK_SOURCE="$PWD/build-nx/deps/dxvk-sarek-1.14.1"
 cmake --build "$native" -j "$jobs"
 for mode in sp mp; do
   sp=OFF

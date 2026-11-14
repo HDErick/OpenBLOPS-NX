@@ -5,10 +5,10 @@ import subprocess
 import sys
 
 root=Path(__file__).resolve().parents[3]
-source=root/'build-nx/deps/dxvk-sarek'
+source=root/'build-nx/deps/dxvk-sarek-1.14.1'
 replay=root/'build-nx/sarek-work/patch-replay'
 patch=root/'tools/nx/patch-dxvk-sarek.py'
-assert subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()=='37f397e142b977a343e920dbc4c7bf7ed2c63a81'
+assert subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()=='0c0e8f6f62c7cb37dbf5d38413517efa00c08fef'
 paths=subprocess.check_output(['git','-c','core.autocrlf=true','-c','core.safecrlf=false',
     '-c','core.filemode=false','-C',str(source),'diff','--ignore-submodules=all','--name-only'],text=True).splitlines()
 for name in ['meson.build',*paths]:

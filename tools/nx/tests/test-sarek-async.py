@@ -4,7 +4,7 @@ import re
 import subprocess
 
 root = Path(__file__).resolve().parents[3]
-source = root / 'build-nx/deps/dxvk-sarek/src/dxvk'
+source = root / 'build-nx/deps/dxvk-sarek-1.14.1/src/dxvk'
 output = root / 'build-nx/sarek-work/async-tests'
 output.mkdir(parents=True, exist_ok=True)
 

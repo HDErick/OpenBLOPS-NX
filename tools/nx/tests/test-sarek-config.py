@@ -9,7 +9,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--compiler', default='/ucrt64/bin/g++.exe')
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[3]
-source = root/'build-nx/deps/dxvk-sarek'
+source = root/'build-nx/deps/dxvk-sarek-1.14.1'
 output = root/'build-nx/sarek-work/config-tests'
 output.mkdir(parents=True, exist_ok=True)
 exe = output/'sarek-config.exe'

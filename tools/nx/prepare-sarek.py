@@ -6,8 +6,8 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT/'build-nx/deps/dxvk-sarek'
-COMMIT = '37f397e142b977a343e920dbc4c7bf7ed2c63a81'
+SOURCE = ROOT/'build-nx/deps/dxvk-sarek-1.14.1'
+COMMIT = '0c0e8f6f62c7cb37dbf5d38413517efa00c08fef'
 URL = 'https://github.com/pythonlover02/dxvk-sarek.git'
 SUBMODULES = {
     'include/spirv': 'ce9dfb01496073a02d74581ae909384763b41ff8',
@@ -18,7 +18,7 @@ def git(*args):
 
 if not SOURCE.exists():
     SOURCE.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(['git','clone','--depth','1','--branch','v1.13.0',
+    subprocess.run(['git','clone','--depth','1','--branch','v1.14.1',
                     '--recurse-submodules',URL,str(SOURCE)],check=True)
 assert (SOURCE/'.git').exists(), 'Expected the Sarek dependency checkout, not the parent repository'
 assert git('rev-parse','HEAD') == COMMIT, 'Unexpected Sarek revision; refusing to overwrite it'
@@ -31,7 +31,7 @@ assert (SOURCE.parent/'dxvk/include/native/directx/d3d9.h').is_file()
 patch=ROOT/'tools/nx/patch-dxvk-sarek.py'
 subprocess.run([sys.executable,str(patch),str(SOURCE)],check=True)
 record={
-    'renderer':'DXVK Sarek 1.13.0', 'repository':URL, 'commit':COMMIT,
+    'renderer':'DXVK Sarek 1.14.1', 'repository':URL, 'commit':COMMIT,
     'submodules':SUBMODULES, 'mesa_sha256':base['mesa_sha256'],
     'portable_com_declarations':{'dxvk_commit':base['dxvk'],
                                 'directx_headers_commit':'9df86f2341616ef1888ae59919feaa6d4fad693d'},
