@@ -1757,8 +1757,8 @@ const NetField planeStateFields[66 + SP_ENTITY_ANIM_FIELDS] =
 
 
 
-const int numVehicleEntityStateFields = 71 + SP_ENTITY_ANIM_FIELDS + SP_VEHICLE_COMPASS_FIELDS;
-const NetField vehicleEntityStateFields[71 + SP_ENTITY_ANIM_FIELDS + SP_VEHICLE_COMPASS_FIELDS] =
+const int numVehicleEntityStateFields = 71 + SP_ENTITY_ANIM_FIELDS + SP_VEHICLE_COMPASS_FIELDS + SP_VEHICLE_ATTACH_FIELDS;
+const NetField vehicleEntityStateFields[71 + SP_ENTITY_ANIM_FIELDS + SP_VEHICLE_COMPASS_FIELDS + SP_VEHICLE_ATTACH_FIELDS] =
 {
   { "eType", 190, 2, -58, 1u, "MSG_FIELD_ETYPE", "NEVER_CHANGES" },
   { "lerp.pos.trTime", 16, 4, -68, 0u, "MSG_FIELD_POS_TRTIME", "0" },
@@ -1852,7 +1852,14 @@ const NetField vehicleEntityStateFields[71 + SP_ENTITY_ANIM_FIELDS + SP_VEHICLE_
   { "weaponModel", 216, 1, 4, 0u, "MAX_WEAPONMODEL_BITS", "0" },
   { "renderOptions", 132, 4, 32, 0u, "MAX_RENDER_OPTIONS_BITS", "0" },
   { "lerp.apos.trTime", 52, 4, -70, 0u, "MSG_FIELD_ANGLE_TRTIME", "0" },
+#ifdef KISAK_SP
+  { "un2.vehicleState.attachModelIndex[0]", offsetof(entityState_s, vehicleState.attachModelIndex[0]), 2, 9, 0u, "MODEL_BITS", "0" },
+  { "un2.vehicleState.attachTagIndex[0]", offsetof(entityState_s, vehicleState.attachTagIndex[0]), 1, 5, 0u, "5", "0" },
+  { "un2.vehicleState.attachModelIndex[1]", offsetof(entityState_s, vehicleState.attachModelIndex[1]), 2, 9, 0u, "MODEL_BITS", "0" },
+  { "un2.vehicleState.attachTagIndex[1]", offsetof(entityState_s, vehicleState.attachTagIndex[1]), 1, 5, 0u, "5", "0" },
+#else
   { "un2.anim.torsoAnim", 140, 4, 11, 0u, "ANIM_BITS", "0" },
+#endif
   { "loopSoundId", 124, 4, 32, 0u, "SOUNDALIAS_BITS", "0" },
   { "loopSoundFade", 208, 2, -16, 0u, "FADETIME_BITS", "0" },
   { "attackerEntityNum", 198, 2, 10, 0u, "GENTITYNUM_BITS", "0" },

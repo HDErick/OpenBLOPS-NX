@@ -344,8 +344,11 @@ constexpr unsigned SP_ENTITY_ANIM_FIELDS = 0;
 
 #ifdef KISAK_SP
 constexpr unsigned SP_VEHICLE_COMPASS_FIELDS = 1;
+// SP vehicles send their two script attachments in place of MP's torso anim.
+constexpr unsigned SP_VEHICLE_ATTACH_FIELDS = 3;
 #else
 constexpr unsigned SP_VEHICLE_COMPASS_FIELDS = 0;
+constexpr unsigned SP_VEHICLE_ATTACH_FIELDS = 0;
 #endif
 
 // These prolly should use the const int as the array size, but yeah
@@ -354,7 +357,7 @@ extern const NetField eventEntityStateFields[69 + SP_ENTITY_ANIM_FIELDS];
 extern const int numActorStateFields;
 extern const NetField actorStateFields[69 + SP_ENTITY_ANIM_FIELDS];
 extern const int numVehicleEntityStateFields;
-extern const NetField vehicleEntityStateFields[71 + SP_ENTITY_ANIM_FIELDS + SP_VEHICLE_COMPASS_FIELDS];
+extern const NetField vehicleEntityStateFields[71 + SP_ENTITY_ANIM_FIELDS + SP_VEHICLE_COMPASS_FIELDS + SP_VEHICLE_ATTACH_FIELDS];
 extern const NetField planeStateFields[66 + SP_ENTITY_ANIM_FIELDS];
 extern const NetField helicopterEntityStateFields[71 + SP_ENTITY_ANIM_FIELDS];
 extern const int numTurretEntityStateFields;
@@ -412,7 +415,7 @@ static NetFieldList s_entityNetFieldList[22] =
   { turretEntityStateFields, 69u + SP_ENTITY_ANIM_FIELDS, "turretEntityStateFields" },
   { helicopterEntityStateFields, 71u + SP_ENTITY_ANIM_FIELDS, "helicopterEntityStateFields" },
   { planeStateFields, 66u + SP_ENTITY_ANIM_FIELDS, "planeStateFields" },
-  { vehicleEntityStateFields, 71u + SP_ENTITY_ANIM_FIELDS + SP_VEHICLE_COMPASS_FIELDS, "vehicleEntityStateFields" },
+  { vehicleEntityStateFields, 71u + SP_ENTITY_ANIM_FIELDS + SP_VEHICLE_COMPASS_FIELDS + SP_VEHICLE_ATTACH_FIELDS, "vehicleEntityStateFields" },
   { entityStateFields, 69u + SP_ENTITY_ANIM_FIELDS, "entityStateFields" },
   { entityStateFields, 69u + SP_ENTITY_ANIM_FIELDS, "entityStateFields" },
   { actorStateFields, 69u + SP_ENTITY_ANIM_FIELDS, "actorStateFields" },
