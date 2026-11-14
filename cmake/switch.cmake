@@ -213,6 +213,7 @@ if(NOT IS_ABSOLUTE "${NX_PORTLIBS}")
     string(REGEX REPLACE "^([A-Za-z]):[\\/]" "/\\1/" NX_PORTLIBS "${NX_PORTLIBS}")
 endif()
 target_include_directories(${BIN_NAME} PUBLIC "${NX_PORTLIBS}/include")
+target_link_libraries(${BIN_NAME} PRIVATE "${NX_PORTLIBS}/lib/libzstd.a")
 if(NX_DXVK)
     set(NX_MESA_SDK "${CMAKE_SOURCE_DIR}/build-nx/deps/mesa/opt/devkitpro/portlibs/switch"
         CACHE PATH "Unified Horizon Mesa 26.2.3 SDK")
@@ -314,12 +315,14 @@ endif()
 
 # FFmpeg supplies WMA, Bink video/audio, and audio resampling.
 set(NX_FFMPEG_DIR "${NX_PORTLIBS}" CACHE PATH "FFmpeg SDK directory")
+set(NX_FFMPEG_DAV1D "${NX_FFMPEG_DIR}/lib/libdav1d.a" CACHE FILEPATH
+    "Optional dav1d library when the FFmpeg SDK was built with AV1 decoding")
 target_include_directories(${BIN_NAME} BEFORE PRIVATE "${NX_FFMPEG_DIR}/include")
 target_link_libraries(${BIN_NAME} PRIVATE
     "${NX_FFMPEG_DIR}/lib/libavcodec.a"
     "${NX_FFMPEG_DIR}/lib/libswresample.a"
     "${NX_FFMPEG_DIR}/lib/libavutil.a"
-    "${NX_FFMPEG_DIR}/lib/libdav1d.a"
+    ${NX_FFMPEG_DAV1D}
     nx m)
 
 # ----- NRO packaging -----

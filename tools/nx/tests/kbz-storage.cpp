@@ -6,8 +6,10 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <vector>
+#include <zstd.h>
 #include "../../../src/nx/nx_kbz_storage.h"
 
 static std::map<void *, size_t> allocations;
@@ -42,6 +44,9 @@ static size_t trackedRead(void *p, size_t size, size_t count, FILE *file) {
 #undef free
 #undef fread
 
+#if !defined(_WIN32)
+#define __cdecl
+#endif
 #define __int8 char
 #define __int16 short
 #define __debugbreak() throw std::runtime_error("engine assertion")
@@ -77,6 +82,21 @@ static std::vector<uint8_t> fixture(uint32_t version) {
     }
     if (version >= 3) { append<uint32_t>(data, 1); append<uint8_t>(data, 0); append<uint32_t>(data, 24); }
     return data;
+}
+static std::vector<uint8_t> packFixture(const std::vector<uint8_t> &data) {
+    auto *context = ZSTD_createCCtx();
+    require(context != nullptr, "could not create zstd context");
+    require(!ZSTD_isError(ZSTD_CCtx_setParameter(context, ZSTD_c_checksumFlag, 1)), "could not set checksum");
+    std::vector<uint8_t> packed{'K', 'B', 'Z', 'Z'};
+    append<uint64_t>(packed, data.size());
+    const size_t headerSize = packed.size();
+    packed.resize(headerSize + ZSTD_compressBound(data.size()));
+    const size_t length = ZSTD_compress2(context, packed.data() + headerSize,
+                                       packed.size() - headerSize, data.data(), data.size());
+    ZSTD_freeCCtx(context);
+    require(!ZSTD_isError(length), "could not compress fixture");
+    packed.resize(headerSize + length);
+    return packed;
 }
 static size_t previousProgress;
 static void progress(size_t completed, size_t total) {
@@ -124,6 +144,37 @@ int main(int argc, char **argv) {
             bad = data; std::memset(bad.data() + 600028 + 1, 0xff, 4); write(path, bad);
             require(NX_ReadKbz(path.string().c_str(), &storage) == -1 && !liveBytes, "overflowing relocation accepted");
         }
+        const auto unpacked = fixture(3);
+        const auto packed = packFixture(unpacked);
+        write(path, packed);
+        peakBytes = 0;
+        require(NX_ReadKbz(path.string().c_str(), &storage, progress) == 1, "packed zone rejected");
+        require(previousProgress == unpacked.size(), "packed progress did not reach EOF");
+        require(storage->blocks[0][599999] == 0x5a && !storage->blocks[1][31], "packed zone data changed");
+        require(peakBytes <= sizeof(NxKbzStorage) + 600000 + 32 + storage->metadataSize + ReadSize,
+                "packed loader allocated a second copy");
+        NX_FreeKbzStorage(storage);
+        require(!liveBytes, "packed unload leaked memory");
+        for (size_t length : {size_t(4), size_t(12), packed.size() - 1}) {
+            write(path, {packed.begin(), packed.begin() + length});
+            require(NX_ReadKbz(path.string().c_str(), &storage) == -1 && !storage && !liveBytes,
+                    "truncated packed zone accepted");
+        }
+        auto badPacked = packed;
+        badPacked.back() ^= 1;
+        write(path, badPacked);
+        require(NX_ReadKbz(path.string().c_str(), &storage) == -1 && !storage && !liveBytes,
+                "damaged packed checksum accepted");
+        badPacked = packed;
+        badPacked[4] ^= 1;
+        write(path, badPacked);
+        require(NX_ReadKbz(path.string().c_str(), &storage) == -1 && !storage && !liveBytes,
+                "incorrect expanded size accepted");
+        badPacked = packed;
+        badPacked.push_back(0);
+        write(path, badPacked);
+        require(NX_ReadKbz(path.string().c_str(), &storage) == -1 && !storage && !liveBytes,
+                "trailing packed bytes accepted");
         require(NX_ReadKbz((path.string()+".missing").c_str(), &storage) == 0 && !storage, "missing file not distinguished");
         write(path, fixture(3));
         for (unsigned i = 0; i < 3; ++i) {
@@ -153,6 +204,6 @@ int main(int argc, char **argv) {
             require(NX_ReadKbz(argv[i], &storage) == 1, argv[i]);
             NX_FreeKbzStorage(storage); require(!liveBytes, "retail zone leaked");
         }
-        puts("PASS: KBZ direct reads, allocation/I/O failures, bounds, progress, zone compaction and 100 unload/reload cycles");
+        puts("PASS: KBZ and KBZZ reads, malformed frames, allocation/I/O failures, progress and 100 unload/reload cycles");
     } catch (const std::exception &error) { fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
 }

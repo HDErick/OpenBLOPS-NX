@@ -164,4 +164,44 @@ if '    if (m_sCursor.Bitmap != nullptr)' in text:
     replace(str(file.relative_to(source)),text[start:end],'')
 replace('src/dxvk/dxvk_pipemanager.cpp', '          DxvkShaderCompileMethod::Dyasync));',
     '          DxvkShaderCompileMethod::Async));')
+
+replace('src/util/sync/sync_recursive.h',
+    '''    std::atomic<uint32_t> m_owner   = { 0u };
+    uint32_t              m_counter = { 0u };''',
+    '''    RMutex m_mutex = {};''')
+replace('src/util/sync/sync_recursive.cpp', '#include "sync_spinlock.h"', '#include <switch.h>')
+replace('src/util/sync/sync_recursive.cpp',
+    '    spin(2000, [this] { return try_lock(); });',
+    '    rmutexLock(&m_mutex);')
+replace('src/util/sync/sync_recursive.cpp',
+    '''    if (likely(m_counter == 0))
+      m_owner.store(0, std::memory_order_release);
+    else
+      m_counter -= 1;''',
+    '    rmutexUnlock(&m_mutex);')
+file = source/'src/util/sync/sync_recursive.cpp'
+text = file.read_text()
+start = text.index('  bool RecursiveSpinlock::try_lock() {\n')
+end = text.index('\n  }', start)
+replace(str(file.relative_to(source)), text[start:end],
+    '  bool RecursiveSpinlock::try_lock() {\n    return rmutexTryLock(&m_mutex);')
+
+replace('src/d3d9/d3d9_device.cpp',
+    '''    if constexpr (ProgramType == DxsoProgramType::VertexShader) {
+      if constexpr (ConstantType == D3D9ConstantType::Float) {
+        m_vsFloatConstsCount = std::max(m_vsFloatConstsCount, StartRegister + Count);''',
+    '''    if constexpr (ConstantType == D3D9ConstantType::Float) {
+      const uint32_t initializedCount = ProgramType == DxsoProgramType::VertexShader
+        ? m_vsFloatConstsCount : m_psFloatConstsCount;
+      const Vector4* current = ProgramType == DxsoProgramType::VertexShader
+        ? m_state.vsConsts.fConsts : m_state.psConsts.fConsts;
+      if (m_d3d9Options.d3d9FloatEmulation != D3D9FloatEmulation::Enabled &&
+          StartRegister + Count <= initializedCount &&
+          std::memcmp(current + StartRegister, pConstantData, Count * sizeof(Vector4)) == 0)
+        return D3D_OK;
+    }
+
+    if constexpr (ProgramType == DxsoProgramType::VertexShader) {
+      if constexpr (ConstantType == D3D9ConstantType::Float) {
+        m_vsFloatConstsCount = std::max(m_vsFloatConstsCount, StartRegister + Count);''')
 print('DXVK Sarek Horizon patches ready')

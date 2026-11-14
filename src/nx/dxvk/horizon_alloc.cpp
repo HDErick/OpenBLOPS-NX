@@ -76,7 +76,7 @@ void *alloc(void *, size_t size, size_t align, VkSystemAllocationScope)
         p = reinterpret_cast<char *>(c.free);
         c.free = c.free->next;
     } else {
-        if (size_t(c.end - c.bump) < block) {
+        if (!c.bump || size_t(c.end - c.bump) < block) {
             char *chunk = static_cast<char *>(memalign(kGranule, kChunk));
             if (!chunk) { unlock(&c.lock); return nullptr; }
             __atomic_fetch_add(&s_chunk_bytes, kChunk, __ATOMIC_RELAXED);
@@ -113,6 +113,9 @@ void *realloc_(void *user, void *memory, size_t size, size_t align, VkSystemAllo
     if (!memory) return alloc(user, size, align, scope);
     if (!size) { release(user, memory); return nullptr; }
     const Header *h = reinterpret_cast<const Header *>(static_cast<char *>(memory) - kHeader);
+    if (h->cls && align <= kGranule && size > (h->cls - 1) * kGranule
+        && size <= h->cls * kGranule)
+        return memory;
     const size_t old = h->cls ? size_t(h->cls) * kGranule : h->size;
     void *p = alloc(user, size, align, scope);
     if (p) {
