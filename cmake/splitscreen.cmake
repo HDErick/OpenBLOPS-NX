@@ -1,6 +1,8 @@
 # Experimental local guest, two-camera and controller build for PC and Switch.
 # Regular builds retain their single-client behavior.
-option(KISAK_EXPERIMENTAL_SPLITSCREEN "Build the experimental local split-screen prototype" OFF)
+# On by default wherever direct connect is on (it requires it), so a new
+# build tree does not silently lose split-screen.
+option(KISAK_EXPERIMENTAL_SPLITSCREEN "Build the experimental local split-screen prototype" ${KISAK_DIRECT_CONNECT})
 if(KISAK_EXPERIMENTAL_SPLITSCREEN)
     if(NOT KISAK_DIRECT_CONNECT)
         message(FATAL_ERROR "Split-screen requires KISAK_DIRECT_CONNECT=ON")

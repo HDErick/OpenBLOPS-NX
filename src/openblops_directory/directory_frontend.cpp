@@ -321,12 +321,88 @@ void PatchMenu(menuDef_t *menu)
     menu->items = copy.items.data();
 }
 } // namespace
+#ifdef KISAK_NX
+namespace
+{
+// Switch: the browser refreshes on Y (the Switch's Y arrives as K_BUTTON_X;
+// Directory_HandleControllerKey). Put the button glyph in front of the stock
+// refresh label. Glyph 3 is X, which nx_switchglyphs draws as the Switch's Y.
+const char *FirstStringConstant(const textDef_s *text)
+{
+    if (!text->textExpData)
+        return text->text;
+    const auto &expression = text->textExpData->textExp;
+    for (int i = 0; expression.rpn && i < expression.numRpn; ++i)
+    {
+        const auto &part = expression.rpn[i];
+        if (part.type == 0 && part.data.constant.dataType == VAL_STRING && part.data.constant.internals.string)
+            return part.data.constant.internals.string;
+    }
+    return nullptr;
+}
+void PatchRefreshPrompt(menuDef_t *menu)
+{
+    if (!Named(menu->window.name, "server_browser_unranked"))
+        return;
+    static std::list<std::string> labels;
+    static std::list<textDef_s> texts;
+    // Label key -> glyph. 3 is X (refresh, the Switch's Y), 1 is the confirm
+    // button's position (join); see below for the glyph drawn.
+    std::vector<std::pair<std::string, char>> keys;
+    for (int i = 0; i < menu->itemCount; ++i)
+    {
+        itemDef_s *item = menu->items[i];
+        const textDef_s *text = item && Item_IsTextDefType(item) ? item->typeData.textDef : nullptr;
+        if (!text)
+            continue;
+        char glyph = 0;
+        if (HasAction(item, "RefreshServers") || HasAction(item, "RefreshFilter"))
+            glyph = '\x03';
+        else if (HasAction(item, "JoinServer"))
+            glyph = '\x02';   // draws as the Switch's A (nx_switchglyphs swaps 1 and 2)
+        if (!glyph)
+            continue;
+        if (const char *key = FirstStringConstant(text))
+            if (key[0] != '\x03' && key[0] != '\x02')
+                keys.emplace_back(key, glyph);
+    }
+    for (int i = 0; i < menu->itemCount && !keys.empty(); ++i)
+    {
+        itemDef_s *item = menu->items[i];
+        if (!item || !Item_IsTextDefType(item) || !item->typeData.textDef)
+            continue;
+        const textDef_s *text = item->typeData.textDef;
+        const char *key = FirstStringConstant(text);
+        if (!key || key[0] == '\x03' || key[0] == '\x02')
+            continue;
+        char glyph = 0;
+        for (const auto &k : keys)
+            if (!glyph && Named(key, k.first.c_str()))
+                glyph = k.second;
+        if (!glyph)
+            continue;
+        std::string shown = key[0] == '@' ? UI_SafeTranslateString(key + 1) : key;
+        // Stock button labels are expressions that upper-case the string.
+        if (text->textExpData)
+            shown = UI_ToUpper(shown.c_str());
+        labels.push_back(std::string(1, glyph) + " " + shown);
+        texts.push_back(*text);
+        texts.back().text = labels.back().c_str();
+        texts.back().textExpData = nullptr;
+        item->typeData.textDef = &texts.back();
+    }
+}
+} // namespace
+#endif
 void Directory_MenuOpening(int localClientNum, UiContext *dc, menuDef_t *menu)
 {
     (void)dc;
     if (localClientNum || !menu)
         return;
     PatchMenu(menu);
+#ifdef KISAK_NX
+    PatchRefreshPrompt(menu);
+#endif
     PatchLobbyCaption(menu);
     PatchServerSettings(menu);
     PatchPasswordPopup(menu);
@@ -363,6 +439,11 @@ bool Directory_HandleMenuEvent(int localClientNum, UiContext *dc, itemDef_s *ite
             }
             if (Named(event, "action"))
             {
+#ifdef KISAK_NX
+                // Out of date: the update popup instead of hosting.
+                if (Directory_UpdateOpenGate())
+                    return true;
+#endif
                 if (!copy.privateAction)
                     return true;
                 CancelPublic(true);

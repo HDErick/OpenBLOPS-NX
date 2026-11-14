@@ -329,9 +329,9 @@ bool G_CheckpointCaptureWorld_SP(checkpoint::Resources& refs,std::vector<std::ui
         Word(bytes,1);std::vector<std::uint8_t> record,again;
         auto capture=[&](auto& source,auto& staging,auto visitor,unsigned type,unsigned slot,unsigned id){
             record.clear();checkpoint::FieldWriter writer(record,refs);visitor(writer,source);
-            checkpoint::FieldReader reader(record,refs);visitor(reader,staging);reader.Finish();
+            if(checkpoint::verifyRoundTrip){checkpoint::FieldReader reader(record,refs);visitor(reader,staging);reader.Finish();
             again.clear();checkpoint::FieldWriter rewriter(again,refs);visitor(rewriter,staging);
-            if(record!=again)throw std::runtime_error("world record changed during round-trip");Record(bytes,type,slot,id,record);
+            if(record!=again)throw std::runtime_error("world record changed during round-trip");}Record(bytes,type,slot,id,record);
         };
         context="level";auto levelStage=std::make_unique<level_locals_t>();capture(level,*levelStage,[](auto& io,auto& x){LevelFields(io,x);},0,0,0);
         TurretInfo turret{};if(level.turrets)for(unsigned i=0;i<MAX_TURRETS;++i)if(level.turrets[i].inuse){

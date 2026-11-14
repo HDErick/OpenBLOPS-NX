@@ -388,7 +388,12 @@ void __cdecl Ragdoll_InitDvars()
     ragdoll_debug                = _Dvar_RegisterInt  ("ragdoll_debug",                0,            0,    0x7FFFFFFF, 0x80u, "Draw ragdoll debug info (bitflags)");
     ragdoll_fps                  = _Dvar_RegisterInt  ("ragdoll_fps",                  20,           0,    100,        0x80u, "Ragdoll update frames per second");
     ragdoll_max_life             = _Dvar_RegisterInt  ("ragdoll_max_life",             9000,         0,    0x7FFFFFFF, 0x80u, "Max lifetime of a ragdoll system in msec");
+#ifdef KISAK_NX
+    // Switch: fewer bodies simulating at once (CPU).
+    ragdoll_max_simulating       = _Dvar_RegisterInt  ("ragdoll_max_simulating",       4,            0,    32,         1u,    "Max number of simultaneous active ragdolls");
+#else
     ragdoll_max_simulating       = _Dvar_RegisterInt  ("ragdoll_max_simulating",       16,           0,    32,         1u,    "Max number of simultaneous active ragdolls");
+#endif
     ragdoll_explode_force        = _Dvar_RegisterFloat("ragdoll_explode_force",        18000.0f,     0.0f, 60000.0f,   0x80u, "Explosive force applied to ragdolls");
     ragdoll_explode_upbias       = _Dvar_RegisterFloat("ragdoll_explode_upbias",       0.80000001f,  0.0f, 2.0f,       0x80u, "Upwards bias applied to ragdoll explosion effects");
     ragdoll_bullet_force         = _Dvar_RegisterFloat("ragdoll_bullet_force",         500.0f,       0.0f, 10000.0f,   0x80u, "Bullet force applied to ragdolls");

@@ -506,8 +506,17 @@ void __cdecl Com_PrintMessage(int channel, char *msg, int error)
                 Monkey_ComPrintHook(msg);
                 Sys_LeaveCriticalSection(CRITSECT_CONSOLE);
             }
+#ifndef KISAK_NX
             if ( channel != 7 && com_logfile && com_logfile->current.integer )
                 Com_LogPrintMessage(channel, msg);
+#else
+            // Switch: no console_mp.log. Its writes went to the SD card on the
+            // printing thread, inside the console critical section, and an SD
+            // write can take hundreds of ms (400-490 ms stalls inside builtins
+            // that print, such as connectpaths). kisakblack.log already gets
+            // every line through Sys_Print and the asynchronous log ring.
+            (void)channel;
+#endif
         }
     }
 }

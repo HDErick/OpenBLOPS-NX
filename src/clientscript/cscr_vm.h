@@ -286,6 +286,9 @@ const char *__cdecl Scr_GetStackThreadPos(
                 bool killThread);
 char *__cdecl Scr_GetRunningThreadPos(scriptInstance_t inst, unsigned int localId);
 unsigned int __cdecl Scr_GetWaitThreadStackId(scriptInstance_t inst, unsigned int localId, unsigned int startLocalId);
+// Notifies the level object (script "level notify( name )") without
+// parameters. Call between script frames on the thread that runs scripts.
+void __cdecl Scr_NotifyLevel(scriptInstance_t inst, unsigned int stringValue);
 void __cdecl Scr_NotifyNum_Internal(
                 scriptInstance_t inst,
                 int clientNum,

@@ -589,6 +589,16 @@ int __cdecl MT_GetSize(scriptInstance_t inst, int numBytes)
     }
 }
 
+bool MT_IsNodeInUse(scriptInstance_t inst, unsigned int nodeNum)
+{
+    if (!nodeNum || nodeNum >= 0x10000)
+        return false;
+    Sys_EnterCriticalSection(CRITSECT_MEMORY_TREE);
+    const bool used = gScrMemTreeDebugGlob[inst].mt_usage[nodeNum] != 0;
+    Sys_LeaveCriticalSection(CRITSECT_MEMORY_TREE);
+    return used;
+}
+
 void __cdecl MT_FreeIndex(scriptInstance_t inst, unsigned int nodeNum, int numBytes)
 {
     const char *v3; // eax
@@ -617,6 +627,22 @@ void __cdecl MT_FreeIndex(scriptInstance_t inst, unsigned int nodeNum, int numBy
         __debugbreak();
     }
     Sys_EnterCriticalSection(CRITSECT_MEMORY_TREE);
+    if (!gScrMemTreeDebugGlob[inst].mt_usage[nodeNum])
+    {
+        // A second free of a node that is already free (seen once in Cuba: an
+        // animation's script string released twice, XAnimFreeInfo). Freeing
+        // it again would corrupt the buddy allocator, and the assert below
+        // ended the game on the Switch. Skip it and report.
+        static int reported;
+        if (reported < 8)
+        {
+            ++reported;
+            Com_PrintWarning(23, "MT_FreeIndex: node %u (inst %i, size %i) is already free; ignoring a second free\n",
+                             nodeNum, (int)inst, size);
+        }
+        Sys_LeaveCriticalSection(CRITSECT_MEMORY_TREE);
+        return;
+    }
     --gScrMemTreeGlob[inst].totalAlloc;
     gScrMemTreeGlob[inst].totalAllocBuckets -= 1 << size;
     if (!gScrMemTreeDebugGlob[inst].mt_usage[nodeNum]

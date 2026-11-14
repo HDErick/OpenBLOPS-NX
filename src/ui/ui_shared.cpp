@@ -3017,6 +3017,9 @@ bool __cdecl Item_IsConditionSatisfied(
 
 void __cdecl Item_RunEventScript(int localClientNum, UiContext *dc, itemDef_s *item, const char *eventName)
 {
+#if defined(KISAK_NX) && defined(OPENBLOPS_NO_STEAM_AUTH)
+    if (Directory_UpdateMenuEvent(localClientNum, dc, item, eventName)) return;
+#endif
     if (Directory_HandleMenuEvent(localClientNum, dc, item, eventName)) return;
 #ifdef KISAK_EXPERIMENTAL_SPLITSCREEN
     if (UI_SplitScreenHandleEvent(localClientNum, dc, item, eventName)) return;

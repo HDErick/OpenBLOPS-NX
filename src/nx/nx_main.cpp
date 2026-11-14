@@ -3,6 +3,7 @@
 // (src/win32/win_main.cpp), which never returns.
 #include <switch.h>
 #include "nx_install.h"
+#include "nx_update.h"
 #include "nx_load_boost.h"
 #include "nx_kbz.h"
 #include "nx_bink_audio.h"
@@ -43,20 +44,127 @@ extern "C" const char *nx_get_install_dir(void)
 // available memory is what it is.)
 extern "C" u32 __nx_heap_size_mult; // not a real libnx symbol; kept for doc
 
-// playername.txt in the game directory: the player's name (first line, up
-// to 31 characters), applied as "+set name". The "name" dvar defaults to
-// "Unknown Soldier", which the server's name validation rejects on purpose,
-// so everyone was "Unknown Soldier 0" -- also what SP scripts read as
-// self.playername. First run (no file, or an empty or unusable name) writes
-// "player" plus four random digits, e.g. player5523. cmdline.txt comes after
-// and can still override it.
+// The Switch user: the user the system started the game with (a title that
+// asks for one); the user the other mode handed over when it chain-loaded
+// this one (SP <-> MP, so no second prompt); the system's "Select a user"
+// (which picks the only user by itself when the console skips it); the last
+// user who opened something. Started from the homebrew menu the first is
+// never there. (After the BO2 port's host_main.cpp.)
+static AccountUid s_accountUid;
+#define NX_USER_HANDOFF NX_GAME_DIR "/nx_user_handoff.bin"
+
+static bool nxTakeHandoffUser(AccountUid *uid)
+{
+    FILE *f = fopen(NX_USER_HANDOFF, "rb");
+    if (!f)
+        return false;
+    const bool read = fread(uid, sizeof(*uid), 1, f) == 1;
+    fclose(f);
+    remove(NX_USER_HANDOFF);
+    AccountProfile profile;   // still a user of this console
+    if (!read || !accountUidIsValid(uid) || R_FAILED(accountGetProfile(&profile, *uid)))
+        return false;
+    accountProfileClose(&profile);
+    return true;
+}
+
+// NX_ChainLoadSibling: the next NRO takes the same user without asking.
+static void nxHandOverUser(void)
+{
+    if (!accountUidIsValid(&s_accountUid))
+        return;
+    if (FILE *f = fopen(NX_USER_HANDOFF, "wb")) {
+        fwrite(&s_accountUid, sizeof(s_accountUid), 1, f);
+        fclose(f);
+    }
+}
+
+static void nxSwitchUserNickname(char *out, size_t size)
+{
+    out[0] = 0;
+    if (R_FAILED(accountInitialize(AccountServiceType_Application)))
+        return;
+    AccountUid uid = {};
+    const char *how = "the user the game was started with";
+    bool found = R_SUCCEEDED(accountGetPreselectedUser(&uid)) && accountUidIsValid(&uid);
+    if (!found && (found = nxTakeHandoffUser(&uid)))
+        how = "the user the other mode handed over";
+    if (!found) {
+        PselUserSelectionSettings settings = {};
+        settings.is_skip_enabled = 1;   // the console's own "skip when there is one user"
+        const Result rc = pselShowUserSelector(&uid, &settings);
+        found = R_SUCCEEDED(rc) && accountUidIsValid(&uid);
+        how = "chosen in Select a user";
+        if (!found)
+            printf("[nx] Select a user: no user chosen (rc 0x%x)\n", rc);
+    }
+    if (!found && (found = R_SUCCEEDED(accountGetLastOpenedUser(&uid)) && accountUidIsValid(&uid)))
+        how = "the last user who opened something";
+    if (found) {
+        s_accountUid = uid;
+        printf("[nx] Switch user: %s\n", how);
+    }
+    AccountProfile profile;
+    if (found && R_SUCCEEDED(accountGetProfile(&profile, uid))) {
+        AccountProfileBase base = {};
+        if (R_SUCCEEDED(accountProfileGet(&profile, nullptr, &base)))
+            snprintf(out, size, "%.*s", (int)sizeof(base.nickname), base.nickname);
+        accountProfileClose(&profile);
+    }
+    accountExit();
+}
+
+// A nickname as a player name: printable ASCII (the game fonts have no other
+// glyphs) without the characters that break userinfo or the command line,
+// spaces trimmed, at least 4 characters and not the "Unknown Soldier"
+// placeholder -- the same rules as playername.txt. "" when unusable.
+static void nxCleanPlayerName(const char *in, char (&out)[32])
+{
+    char name[32] = "";
+    size_t n = 0;
+    for (const char *p = in; *p && n + 1 < sizeof(name); ++p) {
+        const unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c > 0x7e || c == '"' || c == '\\' || c == ';' || c == '+')
+            continue;
+        name[n++] = (char)c;
+    }
+    name[n] = 0;
+    const char *start = name;
+    while (*start == ' ')
+        ++start;
+    size_t length = strlen(start);
+    while (length && start[length - 1] == ' ')
+        --length;
+    char lower[32];
+    for (size_t i = 0; i < length; ++i)
+        lower[i] = (char)tolower((unsigned char)start[i]);
+    lower[length] = 0;
+    out[0] = 0;
+    if (length >= 4 && !strstr(lower, "unknown soldier"))
+        snprintf(out, sizeof(out), "%.*s", (int)length, start);
+}
+
+// The player's name, applied as "+set name": the Switch user's nickname, or
+// when there is no usable one (no user, an applet launch, a nickname with too
+// few ASCII characters) playername.txt in the game directory (first line, up
+// to 31 characters). The "name" dvar defaults to "Unknown Soldier", which the
+// server's name validation rejects on purpose, so everyone was "Unknown
+// Soldier 0" -- also what SP scripts read as self.playername. Without a usable
+// file the first run writes "player" plus four random digits, e.g.
+// player5523. cmdline.txt comes after and can still override it.
 static void nxAppendPlayerName(char *cmdline, size_t size)
 {
-    char name[32];
-    const bool generated = LocalPlayerName::Read(NX_GAME_DIR "/playername.txt", name,
-        static_cast<unsigned int>(randomGet64() % 10000));
-    printf("[nx] player name: %s (%s)\n", name,
-        generated ? "new; change it in playername.txt" : "playername.txt");
+    char nickname[64], name[32];
+    nxSwitchUserNickname(nickname, sizeof(nickname));
+    nxCleanPlayerName(nickname, name);
+    if (name[0]) {
+        printf("[nx] player name: %s (the Switch user)\n", name);
+    } else {
+        const bool generated = LocalPlayerName::Read(NX_GAME_DIR "/playername.txt", name,
+            static_cast<unsigned int>(randomGet64() % 10000));
+        printf("[nx] player name: %s (%s; Switch user '%s' unusable)\n", name,
+            generated ? "new; change it in playername.txt" : "playername.txt", nickname);
+    }
     const size_t len = strlen(cmdline);
     snprintf(cmdline + len, size - len, " +set name \"%s\"", name);
 }
@@ -458,6 +566,7 @@ static u64 nxFindInstalledTitle(const char *name)
 
 extern "C" bool NX_ChainLoadSibling(const char *nroName)
 {
+    nxHandOverUser();
     char path[512];
     const char *slash = strrchr(s_nroPath, '/');
     if (s_nroPath[0] && slash)
@@ -762,6 +871,7 @@ extern "C" void NX_PrepareExit(void)
 {
     if (s_exitPrepared)
         return;
+    NX_UpdateStop();   // the updater's worker, before the sockets close
     nxStallStop();
     ueventCreate(&s_exitDone, false);
     if (R_SUCCEEDED(threadCreate(&s_exitWatchdog, nxExitWatchdog, nullptr, nullptr, 0x4000, 0x2B, -2))
@@ -854,6 +964,8 @@ int main(int argc, char **argv)
     chdir(NX_GAME_DIR);
 
     nxSetupLogging();
+    // Files an update could not replace while they were in use (nx_update.h).
+    NX_UpdateApplyPending();
     nxStallStart();
 #ifdef NX_DXVK
     NX_DxvkConfigure(s_nroPath[0] ? s_nroPath : NX_GAME_DIR "/" NX_GAME_NRO);
@@ -884,6 +996,11 @@ int main(int argc, char **argv)
     nxAppendCmdlineFile(cmdline, sizeof(cmdline));
     printf("command line: %s\n", cmdline);
     nx_set_command_line(cmdline);
+    // The update check runs while the game loads, so its popup can show as
+    // soon as the main menu does (MP takes several seconds to get there).
+    // "+set nx_update_check 0" in cmdline.txt turns it off.
+    if (!strstr(cmdline, "nx_update_check 0") && !strstr(cmdline, "nx_update_check \"0\""))
+        NX_UpdateStartCheck();
 
     // WinMain runs the engine and never returns (infinite Com_Frame loop).
     int rc = WinMain((HINSTANCE)1, NULL, cmdline, 1);

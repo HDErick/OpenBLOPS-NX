@@ -500,3 +500,15 @@ build-nx-direct-sp/
 # Local offline multiplayer profile snapshots
 openblops-mp-profile-*.dat
 OpenBLOPS-PC-NX-Handoff.txt
+
+# Local leftovers that are no longer part of the repository
+/.claude/
+/docs/
+/README-*.md
+!/README-SWITCH.md
+/switch-meta/*.jpg
+/tools/ffconv/*.bin
+/tools/ffconv/probe_tmp.cpp
+/tools/nx/direct-connect/
+/tools/pc/*.cmd
+/tools/pc/capture-mp-crash.py

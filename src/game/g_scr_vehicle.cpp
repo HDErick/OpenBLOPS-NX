@@ -10587,10 +10587,12 @@ void __cdecl CMD_VEH_SetGunnerTargetEnt(scr_entref_t entref)
     *v3 = targetOffset[0];
     v3[1] = targetOffset[1];
     v3[2] = targetOffset[2];
+    // The decompiled code went through an int holding the address, which
+    // truncates the pointer on 64-bit Switch (crash in Zombies vehicles).
     veh->gunnerTargets[gunnerIndex].targetOrigin[0] = 0.0f;
-    targetOrigin = (int)veh->gunnerTargets[gunnerIndex].targetOrigin;
-    *(unsigned int *)(targetOrigin + 4) = 0;
-    *(unsigned int *)(targetOrigin + 8) = 0;
+    veh->gunnerTargets[gunnerIndex].targetOrigin[1] = 0.0f;
+    veh->gunnerTargets[gunnerIndex].targetOrigin[2] = 0.0f;
+    (void)targetOrigin;
 }
 
 void __cdecl CMD_VEH_ClearGunnerTarget(scr_entref_t entref)

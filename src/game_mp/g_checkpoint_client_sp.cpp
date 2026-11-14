@@ -100,15 +100,16 @@ bool G_CheckpointCaptureClient_SP(std::vector<std::uint8_t>& bytes,CheckpointCli
         saved->timeScale=Com_GetTimeScale();saved->scaleStart=cg.timeScaleStart;saved->scaleEnd=cg.timeScaleEnd;saved->scaleStartTime=cg.timeScaleTimeStart;saved->scaleEndTime=cg.timeScaleTimeEnd;saved->missionFailed=Dvar_GetBool("hud_missionFailed");
         saved->underwater=cg.underwaterVision;saved->lowHealth=cg.lowHealthVision;saved->damageVisionEnd=cg.damageVisionEndTime;saved->deathQuote=cg.deathQuoteTime;
         checkpoint::Resources refs;std::vector<std::uint8_t> fields,again;checkpoint::FieldWriter writer(fields,refs);PresentationFields(writer,*saved);
-        checkpoint::FieldReader reader(fields,refs);PresentationFields(reader,*staging);reader.Finish();checkpoint::FieldWriter rewriter(again,refs);PresentationFields(rewriter,*staging);
-        if(fields!=again)throw std::runtime_error("client presentation changed during round-trip");
+        if(checkpoint::verifyRoundTrip){checkpoint::FieldReader reader(fields,refs);PresentationFields(reader,*staging);reader.Finish();checkpoint::FieldWriter rewriter(again,refs);PresentationFields(rewriter,*staging);
+        if(fields!=again)throw std::runtime_error("client presentation changed during round-trip");}
         std::vector<std::uint8_t> fakes,destructibles;unsigned fakeCount=0,destructibleCount=0;
         checkpoint::Resources clientRefs;clientRefs.stringName=[](std::uint16_t id){return SL_ConvertToString(id,SCRIPTINSTANCE_CLIENT);};clientRefs.findString=[](const char* text){return static_cast<std::uint16_t>(SL_FindString(text,SCRIPTINSTANCE_CLIENT));};
         Word(fakes,1);Word(fakes,0);Word(fakes,cg_fakeEntitiesInuseCountFromMap);Word(fakes,cg_fakeEntitiesInuseCountFromLoadScript);
         auto fakeStage=std::make_unique<fake_centity_s>();
         for(unsigned i=0;i<512;++i)if(cg_fakeEntitiesInuseArray[i]){auto& row=cg_fakeEntitiesArray[i];std::vector<std::uint8_t> payload,roundtrip;
-            checkpoint::FieldWriter fw(payload,clientRefs);FakeFakeEntity(fw,row);checkpoint::FieldReader fr(payload,clientRefs);FakeFakeEntity(fr,*fakeStage);fr.Finish();checkpoint::FieldWriter again(roundtrip,clientRefs);FakeFakeEntity(again,*fakeStage);
-            if(payload!=roundtrip)throw std::runtime_error("client fake entity changed during round-trip");
+            checkpoint::FieldWriter fw(payload,clientRefs);FakeFakeEntity(fw,row);
+            if(checkpoint::verifyRoundTrip){checkpoint::FieldReader fr(payload,clientRefs);FakeFakeEntity(fr,*fakeStage);fr.Finish();checkpoint::FieldWriter again(roundtrip,clientRefs);FakeFakeEntity(again,*fakeStage);
+            if(payload!=roundtrip)throw std::runtime_error("client fake entity changed during round-trip");}
             Word(fakes,i);Blob(fakes,payload);unsigned destructible=0;
             if(row.cent.destructible){auto delta=reinterpret_cast<std::uintptr_t>(row.cent.destructible)-reinterpret_cast<std::uintptr_t>(cg_destructibles[0]);
                 if(delta>=sizeof(Destructible)*CG_MAX_DESTRUCTIBLES_SP||delta%sizeof(Destructible))throw std::runtime_error("fake entity destructible is outside client pool");destructible=static_cast<unsigned>(delta/sizeof(Destructible))+1;}
@@ -119,8 +120,9 @@ bool G_CheckpointCaptureClient_SP(std::vector<std::uint8_t>& bytes,CheckpointCli
         for(unsigned i=0;i<CG_MAX_DESTRUCTIBLES_SP;++i){auto& row=cg_destructibles[0][i];if(row.entNum==1023)continue;
             if(!row.ddef||row.ddef->numPieces<0||row.ddef->numPieces>4096||(!row.pieceArray&&row.ddef->numPieces))throw std::runtime_error("invalid client destructible");
             checkpoint::SavedDestructible_SP saved,staging;saved.value=row;saved.definition=row.ddef->name;if(row.ddef->numPieces)saved.pieces.assign(row.pieceArray,row.pieceArray+row.ddef->numPieces);
-            std::vector<std::uint8_t> payload,roundtrip;checkpoint::FieldWriter dw(payload,clientRefs);checkpoint::DestructibleFields(dw,saved);checkpoint::FieldReader dr(payload,clientRefs);checkpoint::DestructibleFields(dr,staging);dr.Finish();checkpoint::FieldWriter aw(roundtrip,clientRefs);checkpoint::DestructibleFields(aw,staging);
-            if(payload!=roundtrip)throw std::runtime_error("client destructible changed during round-trip");Word(destructibles,i);Blob(destructibles,payload);++destructibleCount;
+            std::vector<std::uint8_t> payload,roundtrip;checkpoint::FieldWriter dw(payload,clientRefs);checkpoint::DestructibleFields(dw,saved);
+            if(checkpoint::verifyRoundTrip){checkpoint::FieldReader dr(payload,clientRefs);checkpoint::DestructibleFields(dr,staging);dr.Finish();checkpoint::FieldWriter aw(roundtrip,clientRefs);checkpoint::DestructibleFields(aw,staging);
+            if(payload!=roundtrip)throw std::runtime_error("client destructible changed during round-trip");}Word(destructibles,i);Blob(destructibles,payload);++destructibleCount;
         }
         for(int i=0;i<4;++i)destructibles[4+i]=static_cast<std::uint8_t>(destructibleCount>>(8*i));
         std::vector<std::uint8_t> models;Word(models,1);Word(models,0);unsigned modelCount=0;

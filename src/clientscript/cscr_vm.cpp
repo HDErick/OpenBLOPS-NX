@@ -1013,6 +1013,33 @@ void __cdecl Scr_NotifyNum_Internal(
     SL_CheckExists(inst, stringValue);
 }
 
+void __cdecl Scr_NotifyLevel(scriptInstance_t inst, unsigned int stringValue)
+{
+    // Scr_NotifyNum_Internal with the level object and no parameters.
+    const unsigned int id = gScrVarPub[inst].levelId;
+    if (!id || !gScrVarPub[inst].timeArrayId)
+        return;
+    SL_CheckExists(inst, stringValue);
+    const char *varUsagePos = gScrVarPub[inst].varUsagePos;
+    if (!varUsagePos)
+        gScrVarPub[inst].varUsagePos = "<script notify variable>";
+    Scr_ClearOutParams(inst);
+    VariableValue *startTop = gScrVmPub[inst].top;
+    const unsigned int inparamcount = gScrVmPub[inst].inparamcount;
+    const int type = startTop->type;
+    startTop->type = 8;
+    gScrVmPub[inst].inparamcount = 0;
+    VM_Notify(inst, id, stringValue, gScrVmPub[inst].top);
+    startTop->type = type;
+    while (gScrVmPub[inst].top != startTop)
+    {
+        RemoveRefToValue(inst, gScrVmPub[inst].top->type, gScrVmPub[inst].top->u);
+        --gScrVmPub[inst].top;
+    }
+    gScrVmPub[inst].inparamcount = inparamcount;
+    gScrVarPub[inst].varUsagePos = varUsagePos;
+}
+
 void __cdecl VM_Notify(
     scriptInstance_t inst,
     unsigned int notifyListOwnerId,

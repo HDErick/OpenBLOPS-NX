@@ -137,6 +137,8 @@ void __cdecl MT_RemoveHeadMemoryNode(scriptInstance_t inst, unsigned int size);
 void __cdecl MT_Error(scriptInstance_t inst, const char *funcName, int numBytes);
 int __cdecl MT_GetSize(scriptInstance_t inst, int numBytes);
 void __cdecl MT_FreeIndex(scriptInstance_t inst, unsigned int nodeNum, int numBytes);
+// False for a node that is free (a second free of it would corrupt the tree).
+bool MT_IsNodeInUse(scriptInstance_t inst, unsigned int nodeNum);
 char __cdecl MT_RemoveMemoryNode(scriptInstance_t inst, int oldNode, unsigned int size);
 char *__cdecl MT_Alloc(int numBytes, int type, scriptInstance_t inst);
 void __cdecl MT_Free(_BYTE *p, int numBytes, scriptInstance_t inst);

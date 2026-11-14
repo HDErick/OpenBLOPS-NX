@@ -6,6 +6,7 @@
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 
 namespace checkpoint {
@@ -39,23 +40,35 @@ struct Resources {
         for(auto& ref:scriptReferences)if(ref.archiveId==archiveId)return ref.nativeId;
         throw std::runtime_error("missing checkpoint script root");
     }
+    // (kind, pointer) -> first matching id, so Intern is not a linear search per
+    // reference (a campaign save interns ~4000 resources from ~15000 objects).
+    // It returns the same id the search did: the first entry that matches.
+    struct IndexKey { ResourceKind kind;const void* pointer;bool operator==(const IndexKey& o)const{return kind==o.kind&&pointer==o.pointer;} };
+    struct IndexHash { std::size_t operator()(const IndexKey& k)const{return std::hash<const void*>()(k.pointer)^(static_cast<std::size_t>(k.kind)*0x9e3779b9u);} };
+    std::unordered_map<IndexKey,std::uint32_t,IndexHash> index_;
+    std::size_t indexed_=0;bool indexDirty_=false;
+    void SyncIndex(){
+        if(indexDirty_||indexed_>entries.size()){index_.clear();indexed_=0;indexDirty_=false;}
+        for(;indexed_<entries.size();++indexed_)if(entries[indexed_].pointer)index_.emplace(IndexKey{entries[indexed_].kind,entries[indexed_].pointer},static_cast<std::uint32_t>(indexed_+1));
+    }
     std::uint32_t Intern(ResourceKind kind,const void* p) {
         if(!p)return 0;
-        for(std::size_t i=0;i<entries.size();++i)if(entries[i].kind==kind&&entries[i].pointer==p)return static_cast<std::uint32_t>(i+1);
+        SyncIndex();
+        auto found=index_.find(IndexKey{kind,p});if(found!=index_.end())return found->second;
         if(entries.size()>=65535)throw std::runtime_error("checkpoint resource catalog full");
         entries.push_back({kind,p});return static_cast<std::uint32_t>(entries.size());
     }
-    void Declare(const std::vector<ResourceKind>& kinds){entries.clear();for(auto kind:kinds)entries.push_back({kind,nullptr});}
+    void Declare(const std::vector<ResourceKind>& kinds){entries.clear();for(auto kind:kinds)entries.push_back({kind,nullptr});indexDirty_=true;}
     void Bind(std::uint32_t id,ResourceKind kind,const void* pointer){
         if(!id||id>entries.size()||entries[id-1].kind!=kind||!pointer||entries[id-1].pointer)throw std::runtime_error("invalid/duplicate checkpoint resource binding");
-        entries[id-1].pointer=pointer;
+        entries[id-1].pointer=pointer;indexDirty_=true;
     }
     // Replace only an inert physics token after collision/model reconstruction.
     // Other resource kinds bind once and may never silently change owners.
     void BindRebuiltPhysics(std::uint32_t id,const void* token,const void* body){
         if(!id||id>entries.size()||entries[id-1].kind!=ResourceKind::Physics||!token||!body||entries[id-1].pointer!=token||token==body)
             throw std::runtime_error("invalid rebuilt checkpoint physics binding");
-        entries[id-1].pointer=body;
+        entries[id-1].pointer=body;indexDirty_=true;
     }
     const void* Resolve(ResourceKind kind,std::uint32_t id)const {
         if(!id)return nullptr;

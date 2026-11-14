@@ -147,6 +147,9 @@ void __cdecl G_ProcessVehicleNodeCommand(const RadiantCommand *command, SpawnVar
 unsigned __int16 __cdecl GScr_GetVehicleNodeIndex(unsigned int index);
 void __cdecl GScr_AddFieldsForVehicleNode();
 void __cdecl GScr_GetVehicleNodeField(unsigned int entnum, unsigned int offset);
+#ifdef KISAK_SP
+void __cdecl GScr_SetVehicleNodeField(unsigned int entnum, unsigned int offset);
+#endif
 void __cdecl GScr_GetVehicleNode();
 #ifdef KISAK_SP
 void GScr_GetAllVehicleNodes();

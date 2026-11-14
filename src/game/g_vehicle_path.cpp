@@ -7,6 +7,7 @@
 #include <universal/com_math_anglevectors.h>
 #include "g_scr_helicopter.h"
 #include <clientscript/cscr_vm.h>
+#include <clientscript/cscr_main.h>
 #include <game_mp/g_spawn_mp.h>
 #include "g_load_utils.h"
 #include "sentient_fields.h"
@@ -1992,6 +1993,28 @@ void __cdecl GScr_GetVehicleNodeField(unsigned int entnum, unsigned int offset)
     }
     GScr_GetGenericField((unsigned __int8 *)&s_nodes[entnum], vn_fields[offset].type, vn_fields[offset].ofs, 0);
 }
+
+#ifdef KISAK_SP
+// Retail SP writes a vehicle node field marked writable (only origin) and
+// refuses the rest with "vehicle node field is read-only: %s" (BlackOps.exe has
+// that string, not MP's blanket "vehicle node is read-only"). Cuba's getaway
+// moves its vehicle nodes this way every frame; refusing every write raised
+// ~37 script errors a frame and took the Switch to ~7 fps.
+void __cdecl GScr_SetVehicleNodeField(unsigned int entnum, unsigned int offset)
+{
+    if ( offset >= 0xB || entnum >= (unsigned int)s_numNodes )
+    {
+        Scr_Error(va("vehicle node field %u of node %u out of range", offset, entnum), 0);
+        return;
+    }
+    if ( !vn_fields[offset].writable )
+    {
+        Scr_Error(va("vehicle node field is read-only: %s", vn_fields[offset].name), 0);
+        return;
+    }
+    Scr_SetGenericField((unsigned __int8 *)&s_nodes[entnum], vn_fields[offset].type, vn_fields[offset].ofs, SCRIPTINSTANCE_SERVER, 0);
+}
+#endif
 
 void __cdecl GScr_GetVehicleNode()
 {

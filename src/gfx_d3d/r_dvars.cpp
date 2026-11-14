@@ -605,7 +605,11 @@ void __cdecl R_RegisterDvars()
     r_ignoreHwGamma = _Dvar_RegisterBool("r_ignorehwgamma", 0, 0x21u, "Ignore hardware gamma");
     r_texFilterAnisoMax = _Dvar_RegisterInt(
                                                     "r_texFilterAnisoMax",
+#ifdef KISAK_NX
+                                                    2,   // Switch: texture bandwidth (PC: 16)
+#else
                                                     16,
+#endif
                                                     1,
                                                     16,
                                                     1u,
@@ -720,28 +724,46 @@ void __cdecl R_RegisterDvars()
                                                     0.0,
                                                     1u,
                                                     "Offset bias for decal polygons; bigger values z-fight less but poke through walls more");
+    // Switch: texture quality "Normal" (the options menu's Low/Normal/High/Extra
+    // are picmip 3/2/1/0, set for color, normal and specular maps together).
     r_picmip_manual = _Dvar_RegisterBool(
                                             "r_picmip_manual",
+#ifdef KISAK_NX
+                                            1,
+#else
                                             0,
+#endif
                                             1u,
                                             "If 0, picmip is set automatically.    If 1, picmip is set based on the other r_picmip dvars.");
     r_picmip = _Dvar_RegisterInt(
                              "r_picmip",
+#ifdef KISAK_NX
+                             2,
+#else
                              0,
+#endif
                              0,
                              3,
                              1u,
                              "Picmip level of color maps.    If r_picmip_manual is 0, this is read-only.");
     r_picmip_bump = _Dvar_RegisterInt(
                                         "r_picmip_bump",
+#ifdef KISAK_NX
+                                        2,
+#else
                                         0,
+#endif
                                         0,
                                         3,
                                         1u,
                                         "Picmip level of normal maps.    If r_picmip_manual is 0, this is read-only.");
     r_picmip_spec = _Dvar_RegisterInt(
                                         "r_picmip_spec",
+#ifdef KISAK_NX
+                                        2,
+#else
                                         0,
+#endif
                                         0,
                                         3,
                                         1u,
@@ -1454,7 +1476,9 @@ void __cdecl R_RegisterDvars()
                                                                  "Provides high-res spot shadows for the only one spotlight in the scene.");
     sm_debugFastSunShadow = _Dvar_RegisterBool("sm_debugFastSunShadow", 0, 0x80u, "Debug fast sun shadow");
 #ifdef KISAK_NX
-    r_stream = _Dvar_RegisterInt("r_stream", 2, 0, 7, 0x80u, "Stream high mip levels (1=world|2=xmodels|4=bmodels)");
+    // Switch: no texture streaming; every image keeps the mips it loaded with
+    // (for performance; see also the r_picmip defaults).
+    r_stream = _Dvar_RegisterInt("r_stream", 0, 0, 7, 0x80u, "Stream high mip levels (1=world|2=xmodels|4=bmodels)");
 #else
     r_stream = _Dvar_RegisterInt("r_stream", 7, 0, 7, 0x80u, "Stream high mip levels (1=world|2=xmodels|4=bmodels)");
 #endif
@@ -1528,7 +1552,12 @@ void __cdecl R_RegisterDvars()
     _Dvar_RegisterFloat("r_stereoTurretShift", 0.0, 0.0, 10000.0, 0x1000u, "3D turret shift");
     r_blur_allowed = _Dvar_RegisterBool("r_blur_allowed", 1, 1u, "Allow blur.");
     r_blur = _Dvar_RegisterFloat("r_blur", 0.0, 0.0, 32.0, 0x80u, "Dev tweak to blur the screen");
+#ifdef KISAK_NX
+    // Switch: off by default, an extra resolve and full-screen pass when active.
+    r_distortion = _Dvar_RegisterBool("r_distortion", 0, 1u, "Enable distortion");
+#else
     r_distortion = _Dvar_RegisterBool("r_distortion", 1, 1u, "Enable distortion");
+#endif
     r_flame_allowed = _Dvar_RegisterBool("r_flame_allowed", 1, 1u, "Allow flame effect.");
 #ifdef KISAK_SP
     _Dvar_RegisterBool("sm_sunShadowSmallScriptPS3OnlyEnable", false, 0x1000u, "use quarter resolution sun shadow map");
@@ -1760,7 +1789,12 @@ void __cdecl R_RegisterDvars()
                                              2.0,
                                              0x5000u,
                                              "water wave speed");
+#ifdef KISAK_NX
+    // Switch: off by default, an extra full-screen blur pass (ADS, cutscenes).
+    r_dof_enable = _Dvar_RegisterBool("r_dof_enable", 0, 0x4001u, "Enable the depth of field effect");
+#else
     r_dof_enable = _Dvar_RegisterBool("r_dof_enable", 1, 0x4001u, "Enable the depth of field effect");
+#endif
     r_dof_tweak = _Dvar_RegisterBool(
                                     "r_dof_tweak",
                                     0,

@@ -1084,6 +1084,22 @@ void __cdecl SL_FreeString(scriptInstance_t inst, unsigned int stringValue, RefS
         Sys_LeaveCriticalSection(CRITSECT_SCRIPT_STRING);
         return;
     }
+    else if (!MT_IsNodeInUse(inst, stringValue))
+    {
+        // Released one time too many (seen once in Cuba from XAnimFreeInfo):
+        // the string is already freed and unlinked. Freeing it again would
+        // corrupt the hash table and the memory tree, and the assert ended
+        // the game on the Switch. Skip it and report.
+        static int reported;
+        if (reported < 8)
+        {
+            ++reported;
+            Com_PrintWarning(23, "SL_FreeString: string %u (inst %i) is already free; ignoring a second release\n",
+                             stringValue, (int)inst);
+        }
+        Sys_LeaveCriticalSection(CRITSECT_SCRIPT_STRING);
+        return;
+    }
     else
     {
         entry = &gScrStringGlob[inst].hashTable[index];

@@ -34,7 +34,16 @@ target_sources(KisakBlack PRIVATE
     "${SRC_DIR}/openblops_directory/directory_engine.cpp"
     "${SRC_DIR}/openblops_directory/directory_frontend.cpp"
     "${SRC_DIR}/openblops_directory/directory_zombies.cpp"
+    "${SRC_DIR}/openblops_directory/directory_update.cpp"
 )
+# Default bo1_directory endpoint compiled into the game (numeric IPv4:UDP-port).
+# Empty in the published source; set it per build tree, e.g.
+# -DOPENBLOPS_DIRECTORY_DEFAULT=203.0.113.1:3075, so no address is committed.
+set(OPENBLOPS_DIRECTORY_DEFAULT "" CACHE STRING "Default bo1_directory endpoint (numeric IPv4:UDP-port)")
+if(OPENBLOPS_DIRECTORY_DEFAULT)
+    set_property(SOURCE "${SRC_DIR}/openblops_directory/directory_engine.cpp" APPEND PROPERTY
+        COMPILE_DEFINITIONS "BO1_DIRECTORY_DEFAULT=\"${OPENBLOPS_DIRECTORY_DEFAULT}\"")
+endif()
 
 include(cmake/direct-connect.cmake)
 include(cmake/splitscreen.cmake)

@@ -2018,13 +2018,17 @@ void __cdecl DynEnt_GetClientIdDrawType(unsigned __int16 absId, unsigned __int16
     if ( absId >= cm.originalDynEntCount + 256 )
     {
         brushid = absId - cm.originalDynEntCount - 256;
-        if ( &cm.dynEntClientList[0][absId] != &cm.dynEntClientList[1][brushid]
+        // Retail asserted the brush client list sits right after the model list
+        // (true for the x86 zone layout). Converted Switch zones place the lists
+        // apart, so that check failed (crash on explosions near linked brush
+        // dynents). Lookups use the brush list directly; check the range instead.
+        if ( brushid >= cm.dynEntCount[DYNENT_DRAW_BRUSH]
             && !Assert_MyHandler(
                         "C:\\projects_pc\\cod\\codsrc\\src\\DynEntity\\DynEntity_load_obj.cpp",
                         1488,
                         0,
                         "%s",
-                        "&cm.dynEntClientList[DYNENT_DRAW_MODEL][absId] == &cm.dynEntClientList[DYNENT_DRAW_BRUSH][brushid]") )
+                        "brushid < cm.dynEntCount[DYNENT_DRAW_BRUSH]") )
         {
             __debugbreak();
         }
@@ -2045,13 +2049,17 @@ DynEntityClient *__cdecl DynEnt_GetClientEntity(unsigned __int16 id)
     if ( id < cm.originalDynEntCount + 256 )
         return &cm.dynEntClientList[0][id];
     brushid = id - cm.originalDynEntCount - 256;
-    if ( &cm.dynEntClientList[0][id] != &cm.dynEntClientList[1][brushid]
+    // Retail asserted the brush client list sits right after the model list
+    // (true for the x86 zone layout). Converted Switch zones place the lists
+    // apart, so that check failed (crash on explosions near linked brush
+    // dynents). Lookups use the brush list directly; check the range instead.
+    if ( brushid >= cm.dynEntCount[DYNENT_DRAW_BRUSH]
         && !Assert_MyHandler(
                     "C:\\projects_pc\\cod\\codsrc\\src\\DynEntity\\DynEntity_load_obj.cpp",
                     1503,
                     0,
                     "%s",
-                    "&cm.dynEntClientList[DYNENT_DRAW_MODEL][id] == &cm.dynEntClientList[DYNENT_DRAW_BRUSH][brushid]") )
+                    "brushid < cm.dynEntCount[DYNENT_DRAW_BRUSH]") )
     {
         __debugbreak();
     }

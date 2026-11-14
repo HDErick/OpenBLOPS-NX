@@ -149,9 +149,9 @@ bool G_CheckpointCaptureActors_SP(checkpoint::Resources& refs,std::vector<std::u
         std::vector<std::uint8_t> saved,again;
         auto capture=[&](auto& source,auto& staging,auto visitor,unsigned index,checkpoint::ResourceKind kind){
             saved.clear();checkpoint::FieldWriter writer(saved,refs);visitor(writer,source);
-            checkpoint::FieldReader reader(saved,refs);visitor(reader,staging);reader.Finish();
+            if(checkpoint::verifyRoundTrip){checkpoint::FieldReader reader(saved,refs);visitor(reader,staging);reader.Finish();
             again.clear();checkpoint::FieldWriter rewriter(again,refs);visitor(rewriter,staging);
-            if(saved!=again)throw std::runtime_error("AI record changed during round-trip");
+            if(saved!=again)throw std::runtime_error("AI record changed during round-trip");}
             AppendWord(bytes,static_cast<unsigned>(kind));AppendWord(bytes,refs.Intern(kind,&source));AppendRecord(bytes,index,saved);
         };
         if(level.actors)for(int i=0;i<MAX_ACTORS;++i)if(level.actors[i].inuse){
@@ -176,19 +176,21 @@ bool G_CheckpointCaptureRecords_SP(checkpoint::Resources& refs,std::vector<std::
         std::vector<std::uint8_t> saved,again;
         auto entity=std::make_unique<gentity_s>();auto client=std::make_unique<gclient_s>();
         for(int i=0;i<MAX_GENTITIES;++i){auto& source=g_entities[i];if(i>=level.num_entities&&!source.r.inuse)continue;
-            context="entity "+std::to_string(i);G_CheckpointWriteEntity_SP(source,refs,saved);G_CheckpointReadEntity_SP(*entity,refs,saved);G_CheckpointWriteEntity_SP(*entity,refs,again);
-            if(saved!=again)throw std::runtime_error("entity record changed during round-trip");AppendWord(entityBytes,refs.Intern(checkpoint::ResourceKind::Entity,&source));AppendRecord(entityBytes,i,saved);++entities;
+            context="entity "+std::to_string(i);G_CheckpointWriteEntity_SP(source,refs,saved);
+            if(checkpoint::verifyRoundTrip){G_CheckpointReadEntity_SP(*entity,refs,saved);G_CheckpointWriteEntity_SP(*entity,refs,again);
+            if(saved!=again)throw std::runtime_error("entity record changed during round-trip");}AppendWord(entityBytes,refs.Intern(checkpoint::ResourceKind::Entity,&source));AppendRecord(entityBytes,i,saved);++entities;
             if(source.tagInfo&&std::find(tagObjects.begin(),tagObjects.end(),source.tagInfo)==tagObjects.end())tagObjects.push_back(source.tagInfo);
             if(source.scriptedAnim_SP&&std::find(animations.begin(),animations.end(),source.scriptedAnim_SP)==animations.end())animations.push_back(source.scriptedAnim_SP);
-            if(source.r.inuse&&source.client){context="player "+std::to_string(i);G_CheckpointWritePlayer_SP(*source.client,refs,saved);G_CheckpointReadPlayer_SP(*client,refs,saved);G_CheckpointWritePlayer_SP(*client,refs,again);
-                if(saved!=again)throw std::runtime_error("player record changed during round-trip");AppendWord(playerBytes,refs.Intern(checkpoint::ResourceKind::Client,source.client));AppendRecord(playerBytes,i,saved);++players;}
+            if(source.r.inuse&&source.client){context="player "+std::to_string(i);G_CheckpointWritePlayer_SP(*source.client,refs,saved);
+                if(checkpoint::verifyRoundTrip){G_CheckpointReadPlayer_SP(*client,refs,saved);G_CheckpointWritePlayer_SP(*client,refs,again);
+                if(saved!=again)throw std::runtime_error("player record changed during round-trip");}AppendWord(playerBytes,refs.Intern(checkpoint::ResourceKind::Client,source.client));AppendRecord(playerBytes,i,saved);++players;}
         }
         auto captureAttachment=[&](auto& source,auto visitor,unsigned index,checkpoint::ResourceKind kind){
-            using T=std::remove_reference_t<decltype(source)>;T staging{};
+            using T=std::remove_reference_t<decltype(source)>;
             saved.clear();checkpoint::FieldWriter writer(saved,refs);visitor(writer,source);
-            checkpoint::FieldReader reader(saved,refs);visitor(reader,staging);reader.Finish();
+            if(checkpoint::verifyRoundTrip){T staging{};checkpoint::FieldReader reader(saved,refs);visitor(reader,staging);reader.Finish();
             again.clear();checkpoint::FieldWriter rewriter(again,refs);visitor(rewriter,staging);
-            if(saved!=again)throw std::runtime_error("attachment record changed during round-trip");
+            if(saved!=again)throw std::runtime_error("attachment record changed during round-trip");}
             AppendWord(entityBytes,refs.Intern(kind,&source));AppendRecord(entityBytes,index,saved);
         };
         for(auto* tag:tagObjects){context="tag attachment "+std::to_string(tags);captureAttachment(*tag,[](auto& io,tagInfo_s& x){TagFields(io,x);},tags,checkpoint::ResourceKind::TagInfo);++tags;}
@@ -217,9 +219,9 @@ bool G_CheckpointCaptureRecords_SP(checkpoint::Resources& refs,std::vector<std::
                 }
             }
             saved.clear();checkpoint::FieldWriter writer(saved,refs);checkpoint::AnimationFields(writer,tree);
-            checkpoint::AnimationTree staging;checkpoint::FieldReader reader(saved,refs);checkpoint::AnimationFields(reader,staging);reader.Finish();
+            if(checkpoint::verifyRoundTrip){checkpoint::AnimationTree staging;checkpoint::FieldReader reader(saved,refs);checkpoint::AnimationFields(reader,staging);reader.Finish();
             again.clear();checkpoint::FieldWriter rewriter(again,refs);checkpoint::AnimationFields(rewriter,staging);
-            if(saved!=again)throw std::runtime_error("animation tree changed during round-trip");
+            if(saved!=again)throw std::runtime_error("animation tree changed during round-trip");}
             AppendWord(entityBytes,refs.Intern(checkpoint::ResourceKind::AnimationTree,object->tree));AppendRecord(entityBytes,i,saved);
             ++stats.dobjs;stats.animationNodes+=static_cast<unsigned>(tree.nodes.size());
         }

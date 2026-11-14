@@ -370,6 +370,11 @@ struct __declspec(align(64)) level_locals_t // sizeof=0x3880
 };
 
 int __cdecl G_GetTime();
+#ifdef KISAK_SP
+// True when the host's Quit should end the Zombies match instead (see g_main_mp.cpp).
+bool G_RequestZombiesEndGame_SP();
+bool G_ZombiesHostQuitEnded_SP();
+#endif
 void __cdecl G_RegisterConnectPaths();
 bool __cdecl G_OnlyConnectingPaths();
 void __cdecl G_RegisterRegisterToolDvars();

@@ -4871,8 +4871,32 @@ void __cdecl CL_PlayDemo_f()
     }
 }
 
+#ifdef KISAK_SP
+// The host of an online, system link or co-op Zombies game: Quit ends the
+// match for every player (the game-over screen) instead of dropping them.
+// Solo Zombies and the campaign keep the plain disconnect.
+static bool CL_ZombiesHostQuitEndsGame()
+{
+    if (!com_sv_running || !com_sv_running->current.enabled || sv.state != SS_GAME || Com_IsMenuLevel(nullptr))
+        return false;
+    if (!Dvar_GetBool("zombiemode") || Dvar_GetBool("zombietron"))
+        return false;
+    bool shared = Dvar_GetBool("onlinegame") || Dvar_GetBool("systemlink") || Dvar_GetBool("bo1_directory_publish");
+    for (int i = 1; !shared && svs.clients && i < sv_maxclients->current.integer; ++i)
+        shared = svs.clients[i].header.state >= CS_CONNECTED;
+    if (!shared || !G_RequestZombiesEndGame_SP())
+        return false;
+    UI_SetActiveMenu(0, UIMENU_NONE);   // close the pause menu and unpause, so the scripts run
+    return true;
+}
+#endif
+
 void __cdecl CL_Disconnect_f()
 {
+#ifdef KISAK_SP
+    if (CL_ZombiesHostQuitEndsGame())
+        return;
+#endif
     Directory_CancelJoin();
     int localClientNum; // [esp+0h] [ebp-4h]
 

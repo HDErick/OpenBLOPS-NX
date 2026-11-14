@@ -1050,9 +1050,9 @@ void __cdecl CG_DrawBackdropServerInfo(int localClientNum, float alpha)
     cgs = CG_GetLocalClientStaticGlobals(localClientNum);
     I_strncpyz(serverName, cgs->szHostName, 256);
     UI_UseAltColorPalette(serverName);
-    serverIP = CL_GetServerIPAddress();
-    if ( !I_stricmp(serverIP, "0.0.0.0:0") )
-        serverIP = "";
+    // Retail drew the server's IP address next to its name. Never show a
+    // player's address in game (hosts here are players' own consoles and PCs).
+    serverIP = "";
     fontScale = 0.2f;
     scrPlace = &scrPlaceView[localClientNum];
     do

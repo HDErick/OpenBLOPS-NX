@@ -1,4 +1,5 @@
 #include "checkpoint_archive.h"
+#include <array>
 #include <cstring>
 #include <utility>
 namespace checkpoint {
@@ -8,9 +9,18 @@ void put(std::vector<std::uint8_t>& out,std::uint32_t n){for(int i=0;i<4;++i)out
 std::uint32_t get(const std::vector<std::uint8_t>& b,std::size_t offset){std::uint32_t n=0;for(int i=0;i<4;++i)n|=std::uint32_t(b[offset+i])<<(i*8);return n;}
 bool fail(std::string& error,const char* reason){error=reason;return false;}
 }
+// Table-driven CRC-32 (reflected, 0xedb88320): the same values as the bitwise
+// loop, a table lookup per byte instead of eight shifts. Saves hash the whole
+// image several times and every field name, so this was a large share of a
+// checkpoint's frame time.
+static const std::array<std::uint32_t,256> kCrc32Table=[]{
+    std::array<std::uint32_t,256> table{};
+    for(std::uint32_t i=0;i<256;++i){std::uint32_t crc=i;for(int bit=0;bit<8;++bit)crc=(crc>>1)^((0u-(crc&1u))&0xedb88320u);table[i]=crc;}
+    return table;
+}();
 std::uint32_t Crc32(const void* data,std::size_t bytes){
     auto p=static_cast<const std::uint8_t*>(data);std::uint32_t crc=~0u;
-    for(std::size_t i=0;i<bytes;++i){crc^=p[i];for(int bit=0;bit<8;++bit)crc=(crc>>1)^((0u-(crc&1u))&0xedb88320u);}
+    for(std::size_t i=0;i<bytes;++i)crc=(crc>>8)^kCrc32Table[(crc^p[i])&0xffu];
     return ~crc;
 }
 std::uint32_t Mask(const Image& image){std::uint32_t mask=0;for(const auto& s:image.sections){auto id=static_cast<std::uint32_t>(s.id);if(id<6)mask|=1u<<id;}return mask;}
@@ -53,9 +63,13 @@ bool Store::Prepare(const Image& image,std::string& error){
     prepared_.clear();if(Mask(image)!=kAllSections)return fail(error,"checkpoint incomplete: gameplay restore sections missing");
     if(!Encode(image,prepared_,error))return false;preparedIdentity_=image.identity;return true;
 }
-bool Store::Commit(std::string& error){
+bool Store::PrepareEncoded(std::vector<std::uint8_t> bytes,const Identity& identity,std::string& error){
+    prepared_.clear();if(bytes.size()<Header)return fail(error,"invalid checkpoint length");
+    prepared_=std::move(bytes);preparedIdentity_=identity;error.clear();return true;
+}
+bool Store::Commit(std::string& error,bool verify){
     if(prepared_.empty())return fail(error,"no prepared checkpoint");
-    Image verify;if(!Decode(prepared_,preparedIdentity_,verify,error)){prepared_.clear();return false;}
+    if(verify){Image check;if(!Decode(prepared_,preparedIdentity_,check,error)){prepared_.clear();return false;}}
     committed_.swap(prepared_);prepared_.clear();error.clear();return true;
 }
 bool Store::Read(const Identity& id,Image& out,std::string& error)const{

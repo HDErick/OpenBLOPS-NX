@@ -787,8 +787,12 @@ int __cdecl Scr_SetObjectField(unsigned int classnum, unsigned int entnum, unsig
             Scr_SetPathnodeField(entnum, offset);
             return 1;
         case 3u:
+#ifdef KISAK_SP
+            GScr_SetVehicleNodeField(entnum, offset);
+#else
             v4 = va("vehicle node is read-only");
             Scr_Error(v4, 0);
+#endif
             return 1;
         default:
             v5 = va("bad class num %u", classnum);

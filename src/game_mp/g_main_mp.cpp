@@ -82,6 +82,37 @@
 #ifdef KISAK_SP
 #include "g_scr_main_mp.h"
 #include <gfx_d3d/r_cinematic.h>
+#ifdef KISAK_SP
+#include <atomic>
+// The Zombies host's Quit in an online, system link or co-op game ends the
+// match for everyone: "end_game" on the level runs the scripts' game-over
+// (the same as when every player is down). Disconnecting instead shut the
+// server down under the guests. Requested from the client (main thread,
+// CL_Disconnect_f) and sent here, between script frames on the server thread.
+static std::atomic<bool> g_zombiesEndGameRequested;
+static std::atomic<bool> g_zombiesEndGameSent;
+bool G_RequestZombiesEndGame_SP()
+{
+    if (g_zombiesEndGameSent.load() || g_zombiesEndGameRequested.exchange(true))
+        return false;   // a second Quit while it ends: disconnect as usual
+    return true;
+}
+// The game-over the host's Quit started has played: no map restart after it.
+bool G_ZombiesHostQuitEnded_SP()
+{
+    return g_zombiesEndGameSent.load();
+}
+static void G_ZombiesEndGameFrame_SP()
+{
+    if (!g_zombiesEndGameRequested.exchange(false))
+        return;
+    g_zombiesEndGameSent.store(true);
+    const unsigned int name = SL_GetString((char *)"end_game", 0, SCRIPTINSTANCE_SERVER);
+    Com_Printf(15, "Zombies: host quit, ending the game for every player\n");
+    Scr_NotifyLevel(SCRIPTINSTANCE_SERVER, name);
+    SL_RemoveRefToString(SCRIPTINSTANCE_SERVER, name);
+}
+#endif
 #endif
 
 const char *g_entcountNames[8] =
@@ -868,6 +899,8 @@ void __cdecl    G_InitGame(int levelTime, int randomSeed, int restart, int regis
     // change-level sidecar at the same lifecycle boundary.
     GScr_ResetChangeLevel_SP();
     G_CheckpointInit_SP();
+    g_zombiesEndGameRequested.store(false);
+    g_zombiesEndGameSent.store(false);
 #endif
     if ( !Dvar_GetBool("sv_cheats") && !restart )
         Dvar_SetCheatState();
@@ -1461,10 +1494,16 @@ void G_RegisterDvars()
     _Dvar_RegisterFloat("ai_turnAnimAngleThreshold", 50.0f, 0.0f, 180.0f, 0x4080u, "");
     _Dvar_RegisterFloat("ai_runAnimUpdateFrequency", 0.05f, 0.05f, 0.2f, 0x4080u, "");
 #endif
-#ifdef KISAK_SP
-    ai_corpseCount = _Dvar_RegisterInt("ai_corpseCount", 5, 0, MAX_ACTOR_CORPSES, 0x2001u, "");
+#ifdef KISAK_NX
+    // Switch: fewer AI corpses kept to draw and animate.
+    enum { AI_CORPSE_COUNT_DEFAULT = 4 };
 #else
-    ai_corpseCount = _Dvar_RegisterInt("ai_corpseCount", 5, 0, 8, 0x2001u, "Maximum number of AI corpses");
+    enum { AI_CORPSE_COUNT_DEFAULT = 5 };
+#endif
+#ifdef KISAK_SP
+    ai_corpseCount = _Dvar_RegisterInt("ai_corpseCount", AI_CORPSE_COUNT_DEFAULT, 0, MAX_ACTOR_CORPSES, 0x2001u, "");
+#else
+    ai_corpseCount = _Dvar_RegisterInt("ai_corpseCount", AI_CORPSE_COUNT_DEFAULT, 0, 8, 0x2001u, "Maximum number of AI corpses");
 #endif
     ai_showNodes = _Dvar_RegisterInt("ai_showNodes", 0, 0, 4, 0x80u, "Show AI navigation node debug information");
     ai_showNodesDist = _Dvar_RegisterFloat(
@@ -4036,6 +4075,7 @@ void    G_RunFrame(int levelTime)
     LiveSteam_Server_RunCallbacks();
 #ifdef KISAK_SP
     G_LogCubaProgress_SP();
+    G_ZombiesEndGameFrame_SP();
     G_CheckpointFrame_SP();
 #endif
 }

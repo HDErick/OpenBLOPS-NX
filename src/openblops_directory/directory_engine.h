@@ -29,6 +29,15 @@ bool Directory_AcceptJoinPassword();
 bool Directory_HasPasswordPrompt();
 void Directory_CancelJoinPassword();
 const char *Directory_Status();
+#ifdef KISAK_NX
+// The updater popup (directory_update.cpp).
+void Directory_UpdateFrame();
+bool Directory_UpdateBlocksOnline();
+const char *Directory_UpdateGateMenu(const char *name);
+bool Directory_UpdateOpenGate();
+bool Directory_UpdateMenuEvent(int localClientNum, UiContext *dc, itemDef_s *item, const char *event);
+bool Directory_UpdateControllerKey(int localClientNum, UiContext *dc, menuDef_t *menu, int key);
+#endif
 #else
 inline void Directory_MenuOpening(int, UiContext *, menuDef_t *)
 {

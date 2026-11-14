@@ -725,13 +725,35 @@ void __cdecl ShowLoadErrorsSummary(const char *mapName, unsigned int count)
     }
 }
 
+#ifdef KISAK_SP
+// A Zombies game the host ended with Quit: the scripts' game-over asks for a
+// restart as usual; leave instead (the host disconnects, which ends the
+// session for every player and returns to the menu).
+static bool SV_LeaveInsteadOfRestart_SP()
+{
+    if (!G_ZombiesHostQuitEnded_SP())
+        return false;
+    Com_Printf(15, "Zombies: the host ended the game; leaving instead of restarting the map\n");
+    Cbuf_AddText(0, "disconnect\n");
+    return true;
+}
+#endif
+
 void __cdecl SV_MapRestart_f()
 {
+#ifdef KISAK_SP
+    if (SV_LeaveInsteadOfRestart_SP())
+        return;
+#endif
     SV_MapRestart(0);
 }
 
 void __cdecl SV_FastRestart_f()
 {
+#ifdef KISAK_SP
+    if (SV_LeaveInsteadOfRestart_SP())
+        return;
+#endif
     SV_MapRestart(1);
 }
 

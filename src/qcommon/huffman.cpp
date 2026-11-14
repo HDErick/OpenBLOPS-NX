@@ -104,6 +104,90 @@ int __cdecl nodeCmp(const void *left, const void *right)
     return lnode->weight - rnode->weight;
 }
 
+// Cross-platform: the tree is built by sorting nodes on weight, and several
+// weights tie. qsort leaves tied elements in an order its C library chooses,
+// so the PC (MSVC CRT) and Switch (newlib) trees differed: bytes 155 and 205
+// swapped codes, and a PC client of a Switch host (or the reverse) lost sync
+// in the first gamestate that contained one. Every platform now runs the MSVC
+// CRT algorithm, so the tree stays the one PC builds always produced (checked
+// against the CRT qsort for all 256 codes).
+template <class T>
+static void Huff_MsvcSwap(T *a, T *b) { if (a != b) { T t = *a; *a = *b; *b = t; } }
+template <class T>
+static void Huff_MsvcShortSort(T *lo, T *hi, int (*comp)(const void *, const void *))
+{
+    while (hi > lo)
+    {
+        T *max = lo;
+        for (T *p = lo + 1; p <= hi; ++p)
+            if (comp(p, max) > 0)
+                max = p;
+        Huff_MsvcSwap(max, hi);
+        --hi;
+    }
+}
+template <class T>
+static void Huff_MsvcQsort(T *base, size_t num, int (*comp)(const void *, const void *))
+{
+    enum { CUTOFF = 8, STKSIZ = 8 * sizeof(void *) - 2 };
+    if (num < 2)
+        return;
+    T *lostk[STKSIZ], *histk[STKSIZ];
+    int stkptr = 0;
+    T *lo = base, *hi = base + (num - 1);
+recurse:
+    {
+        const size_t size = size_t(hi - lo) + 1;
+        if (size <= CUTOFF)
+        {
+            Huff_MsvcShortSort(lo, hi, comp);
+        }
+        else
+        {
+            T *mid = lo + size / 2;
+            if (comp(lo, mid) > 0) Huff_MsvcSwap(lo, mid);
+            if (comp(lo, hi) > 0) Huff_MsvcSwap(lo, hi);
+            if (comp(mid, hi) > 0) Huff_MsvcSwap(mid, hi);
+            T *loguy = lo, *higuy = hi;
+            for (;;)
+            {
+                if (mid > loguy)
+                    do { ++loguy; } while (loguy < mid && comp(loguy, mid) <= 0);
+                if (mid <= loguy)
+                    do { ++loguy; } while (loguy <= hi && comp(loguy, mid) <= 0);
+                do { --higuy; } while (higuy > mid && comp(higuy, mid) > 0);
+                if (higuy < loguy)
+                    break;
+                Huff_MsvcSwap(loguy, higuy);
+                if (mid == higuy)
+                    mid = loguy;
+            }
+            ++higuy;
+            if (mid < higuy)
+                do { --higuy; } while (higuy > mid && comp(higuy, mid) == 0);
+            if (mid >= higuy)
+                do { --higuy; } while (higuy > lo && comp(higuy, mid) == 0);
+            if (higuy - lo >= hi - loguy)
+            {
+                if (lo < higuy) { lostk[stkptr] = lo; histk[stkptr] = higuy; ++stkptr; }
+                if (loguy < hi) { lo = loguy; goto recurse; }
+            }
+            else
+            {
+                if (loguy < hi) { lostk[stkptr] = loguy; histk[stkptr] = hi; ++stkptr; }
+                if (lo < higuy) { hi = higuy; goto recurse; }
+            }
+        }
+    }
+    --stkptr;
+    if (stkptr >= 0)
+    {
+        lo = lostk[stkptr];
+        hi = histk[stkptr];
+        goto recurse;
+    }
+}
+
 void __cdecl Huff_BuildFromData(huff_t *huff, const int *msg_hData)
 {
     nodetype *inited; // eax
@@ -121,7 +205,7 @@ void __cdecl Huff_BuildFromData(huff_t *huff, const int *msg_hData)
         inited = Huff_initNode(huff, i, msg_hData[i]);
         heap[i] = inited;
     }
-    qsort(heap, 0x100u, sizeof((heap)[0]), nodeCmp);
+    Huff_MsvcQsort(heap, 0x100u, nodeCmp);
     v3 = Huff_initNode(huff, 257, 1);
     v3->left = huff->tree;
     v3->right = heap[0];
@@ -131,7 +215,7 @@ void __cdecl Huff_BuildFromData(huff_t *huff, const int *msg_hData)
     heap[0] = v3;
     while ( numNodes > 1 )
     {
-        qsort(&heap[heapHead], 256 - heapHead, sizeof((&heap[heapHead])[0]), nodeCmp);
+        Huff_MsvcQsort(&heap[heapHead], 256 - heapHead, nodeCmp);
         v4 = Huff_initNode(huff, 257, 1);
         v4->left = heap[heapHead];
         v4->right = heap[heapHead + 1];

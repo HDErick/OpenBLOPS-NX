@@ -331,6 +331,112 @@ int __cdecl Sys_StringToAdr(const char *s, netadr_t *a)
     return 1;
 }
 
+#ifdef KISAK_NX
+// nx-port: UDP reads on their own thread. A recvfrom is an IPC to the
+// Switch's network service and sometimes took 400-500 ms; it ran on the
+// server thread every packet pass (all modes poll remote UDP), and the main
+// thread waits for that pass, so the game froze 1.5-2.5 s at a time even in
+// a solo campaign. The thread reads into a queue; Sys_GetPacket only takes
+// from it. A slow read now delays remote packets instead of the game.
+#include <atomic>
+#include <mutex>
+namespace
+{
+struct NxQueuedPacket
+{
+    unsigned int socket;
+    sockaddr from;
+    int fromlen;
+    int len;      // < 0: an error, in err
+    int err;
+    unsigned char data[4096];
+};
+constexpr int NX_RECV_SLOTS = 128;
+NxQueuedPacket s_nxRecv[NX_RECV_SLOTS];
+int s_nxRecvHead, s_nxRecvCount;
+std::mutex s_nxRecvLock;
+std::atomic<bool> s_nxRecvStarted;
+NxQueuedPacket s_nxRecvScratch;
+
+void NxRecvPush(const NxQueuedPacket &packet)
+{
+    std::lock_guard<std::mutex> lock(s_nxRecvLock);
+    if (s_nxRecvCount == NX_RECV_SLOTS)
+        return;   // full: dropped, as the network would
+    NxQueuedPacket &slot = s_nxRecv[(s_nxRecvHead + s_nxRecvCount) % NX_RECV_SLOTS];
+    slot.socket = packet.socket;
+    slot.from = packet.from;
+    slot.fromlen = packet.fromlen;
+    slot.len = packet.len;
+    slot.err = packet.err;
+    if (packet.len > 0)
+        memcpy(slot.data, packet.data, packet.len);
+    ++s_nxRecvCount;
+}
+
+DWORD WINAPI NxRecvThread(LPVOID)
+{
+    for (;;)
+    {
+        const unsigned int socket = ip_socket;
+        if (!socket || socket == (unsigned int)INVALID_SOCKET)
+        {
+            Sleep(5);
+            continue;
+        }
+        NxQueuedPacket &packet = s_nxRecvScratch;
+        packet.socket = socket;
+        packet.fromlen = 16;
+        packet.err = 0;
+        packet.len = recvfrom(socket, (char *)packet.data, sizeof(packet.data), 0, &packet.from, &packet.fromlen);
+        if (packet.len < 0)
+        {
+            packet.err = WSAGetLastError();
+            if (packet.err == 10035 || packet.err == 10054)   // nothing waiting / ICMP reset
+            {
+                Sleep(1);
+                continue;
+            }
+            NxRecvPush(packet);
+            Sleep(5);
+            continue;
+        }
+        if (packet.len >= (int)sizeof(packet.data))
+            continue;   // larger than any game datagram: dropped
+        NxRecvPush(packet);
+    }
+}
+
+// recvfrom on the queue: -1 with WSAEWOULDBLOCK when it is empty.
+int NxQueuedRecvFrom(unsigned int socket, char *buf, int len, sockaddr *from, int *fromlen, int *err)
+{
+    if (!s_nxRecvStarted.exchange(true))
+        CreateThread(nullptr, 0x10000, NxRecvThread, nullptr, 0, nullptr);
+    std::lock_guard<std::mutex> lock(s_nxRecvLock);
+    while (s_nxRecvCount)
+    {
+        NxQueuedPacket &slot = s_nxRecv[s_nxRecvHead];
+        s_nxRecvHead = (s_nxRecvHead + 1) % NX_RECV_SLOTS;
+        --s_nxRecvCount;
+        if (slot.socket != socket)
+            continue;   // read from a socket since closed
+        if (slot.len < 0)
+        {
+            *err = slot.err;
+            return -1;
+        }
+        const int n = slot.len < len ? slot.len : len;
+        memcpy(buf, slot.data, n);
+        *from = slot.from;
+        *fromlen = slot.fromlen;
+        return n;
+    }
+    *err = 10035;
+    return -1;
+}
+}
+#endif
+
 int __cdecl Sys_GetPacket(netadr_t *net_from, msg_t *net_message)
 {
 #if 0
@@ -372,10 +478,19 @@ int __cdecl Sys_GetPacket(netadr_t *net_from, msg_t *net_message)
         if (net_socket)
         {
             fromlen = 16;
+#ifdef KISAK_NX
+            int queuedErr = 0;
+            ret = NxQueuedRecvFrom(net_socket, (char *)net_message->data, net_message->maxsize, &from, &fromlen, &queuedErr);
+#else
             ret = recvfrom(net_socket, (char *)net_message->data, net_message->maxsize, 0, &from, &fromlen);
+#endif
             if (ret == -1)
             {
+#ifdef KISAK_NX
+                err = queuedErr;
+#else
                 err = WSAGetLastError();
+#endif
                 if (err == 10050 && nxNetDownReported())   // nx-port: WSAENETDOWN, the console offline
                     ;
                 else if (err != 10035 && err != 10054)
