@@ -18,6 +18,7 @@
 #include "actor_events.h"
 #include <bgame/bg_perks.h>
 #include <cgame/cg_weapons.h>
+#include <client_mp/g_client_mp.h>
 #include <cgame_mp/cg_local_mp.h>
 
 unsigned __int8 scr_playerdamage_boneindex = 254u;
@@ -545,7 +546,34 @@ bool __cdecl Bullet_IgnoreHitEntity(const BulletFireParams *bp, const BulletTrac
     }
     if ( !attacker && !Assert_MyHandler("C:\\projects_pc\\cod\\codsrc\\src\\game\\bullet.cpp", 385, 0, "%s", "attacker") )
         __debugbreak();
-    return br->hitEnt == attacker;
+    const gentity_s *hitEnt = br->hitEnt;
+    if ( hitEnt == attacker )
+        return true;
+#ifdef KISAK_SP
+    // Retail SP 0x007D3440: an AI's bullets pass through what it is linked to
+    // and through every sentient of its own team, the player included. A
+    // bullet that hits a player counts only when its line passes within 8
+    // units of the player's eye, seen from above.
+    if ( attacker->actor )
+    {
+        if ( attacker->tagInfo && attacker->tagInfo->parent == hitEnt )
+            return true;
+        if ( hitEnt->sentient && hitEnt->sentient->eTeam == attacker->sentient->eTeam )
+            return true;
+    }
+    if ( hitEnt->client )
+    {
+        float eye[3];
+        G_GetPlayerViewOrigin(&hitEnt->client->ps, eye);
+        const float length = sqrtf(bp->dir[0] * bp->dir[0] + bp->dir[1] * bp->dir[1]);
+        const float scale = 1.0f / (-length >= 0.0f ? 1.0f : length);
+        const float side = -bp->dir[0] * scale * (br->hitPos[1] - eye[1])
+                         + bp->dir[1] * scale * (br->hitPos[0] - eye[0]);
+        if ( fabsf(side) > 8.0f )
+            return true;
+    }
+#endif
+    return false;
 }
 
 void __cdecl Bullet_Process(
