@@ -1,6 +1,7 @@
 #include <openblops_directory/directory_engine.h>
 #include "common.h"
 #ifdef KISAK_NX
+#include <switch.h>
 #include <nx/nx_load_boost.h>
 #include <nx/nx_stall_scope.h>
 #endif
@@ -159,6 +160,15 @@ const dvar_t *com_first_time;
 const dvar_t *com_first_time_pc;
 const dvar_t *dedicated;
 const dvar_t *com_maxfps;
+#ifdef KISAK_NX
+static const dvar_t *nx_fpsLimit;
+
+int Com_GetFrameRateLimit()
+{
+    const int limit = nx_fpsLimit->current.integer;
+    return limit < 0 ? com_maxfps->current.integer : limit;
+}
+#endif
 const dvar_t *arcademode;
 const dvar_t *zombiemode;
 const dvar_t *zombiemode_path_minz_bias;
@@ -248,6 +258,9 @@ int timeClientFrame;
 int com_frameTime;
 int com_fullyInitialized;
 int com_lastFrameTime[1];
+#ifdef KISAK_NX
+static uint64_t com_lastClientFrameTick;
+#endif
 int com_lastFrameIndex;
 
 HunkUser *liveMemHunk;
@@ -2541,6 +2554,7 @@ void Com_InitDvars()
 #endif
     com_maxfps = _Dvar_RegisterInt("com_maxfps", 85, 0, 1000, 1u, "Cap frames per second");
 #ifdef KISAK_NX
+    nx_fpsLimit = _Dvar_RegisterInt("nx_fpsLimit", -1, -1, 1000, 1u, "Switch frame rate limit (-1 uses com_maxfps, 0 is unlimited)");
     nx_splog = _Dvar_RegisterBool("nx_splog", 0, 0, "Log the SP bring-up traces (lines starting \"SP \")");
 #endif
     arcademode = _Dvar_RegisterBool("arcademode", 0, 0x100u, "Current game is an arcade mode game");
@@ -3397,6 +3411,9 @@ void __cdecl Com_ResetFrametime()
     unsigned int lastFrameIndex; // [esp+4h] [ebp-4h]
 
     timeMsec = Sys_Milliseconds();
+#ifdef KISAK_NX
+    com_lastClientFrameTick = armGetSystemTick();
+#endif
     for ( lastFrameIndex = 0; !lastFrameIndex; lastFrameIndex = 1 )
         com_lastFrameTime[0] = timeMsec;
 }
@@ -3464,6 +3481,42 @@ void __cdecl Com_Frame()
     FrameMark;
 }
 
+#ifdef KISAK_NX
+static int Com_WaitForClientFrame(int maxFPS, int &lastFrameTime)
+{
+    const uint64_t frequency = armGetSystemTickFreq();
+    const int rate = maxFPS > 0 ? maxFPS : 1000;
+    const uint64_t frameTicks = (frequency + rate - 1) / rate;
+
+    for (;;)
+    {
+        Com_EventLoop();
+        const uint64_t now = armGetSystemTick();
+        com_frameTime = Sys_Milliseconds();
+        const int elapsedMsec = (int)(com_frameTime - (unsigned int)lastFrameTime);
+        if (!com_lastClientFrameTick || elapsedMsec < 0)
+        {
+            com_lastClientFrameTick = now;
+            lastFrameTime = com_frameTime;
+        }
+        else
+        {
+            const uint64_t elapsedTicks = now - com_lastClientFrameTick;
+            if (elapsedTicks >= frameTicks && elapsedMsec > 0)
+            {
+                com_lastClientFrameTick = now;
+                lastFrameTime = com_frameTime;
+                return elapsedMsec;
+            }
+
+            const uint64_t remainingNs = elapsedTicks < frameTicks
+                ? armTicksToNs(frameTicks - elapsedTicks) : 1000;
+            svcSleepThread(remainingNs < 8000000 ? remainingNs + 1 : 8000000);
+        }
+    }
+}
+#endif
+
 unsigned int Com_Frame_Try_Block_Function()
 {
     CmdArgs *v0; // eax
@@ -3490,9 +3543,14 @@ unsigned int Com_Frame_Try_Block_Function()
     SetAnimCheck(com_animCheck->current.color[0], SCRIPTINSTANCE_SERVER);
 
     minMsec = 1;
+#ifdef KISAK_NX
+    maxFPS = Com_GetFrameRateLimit();
+#else
     maxFPS = com_maxfps->current.integer;
+#endif
     Com_AdjustMaxFPS(&maxFPS);
 
+#ifndef KISAK_NX
     if (!IsDedicatedServer() && maxFPS > 0)
     {
         minMsec = 1000 / maxFPS;
@@ -3500,6 +3558,7 @@ unsigned int Com_Frame_Try_Block_Function()
         if (!minMsec)
             minMsec = 1;
     }
+#endif
 
     if ( sys_lockThreads->modified )
     {
@@ -3533,6 +3592,9 @@ unsigned int Com_Frame_Try_Block_Function()
     }
     else
     {
+#ifdef KISAK_NX
+        msec = Com_WaitForClientFrame(maxFPS, com_lastFrameTime[lastFrameIndex]);
+#else
         // adapted from kcod4
         for (int i = 0; i < 50; ++i)
         {
@@ -3557,6 +3619,7 @@ unsigned int Com_Frame_Try_Block_Function()
         msec = lastFrameIndex + v4;
         if (!(lastFrameIndex + v4))
             msec = 1;
+#endif
     }
 
     for ( localControllerIndex = 0; localControllerIndex < 1; ++localControllerIndex )

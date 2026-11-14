@@ -1001,10 +1001,11 @@ void __cdecl R_RegisterDvars()
                             "r_vsync",
 #ifdef KISAK_NX
                             0,
+                            1u,
 #else
                             1,
-#endif
                             0x21u,
+#endif
                             "Enable v-sync before drawing the next frame to avoid 'tearing' artifacts.");
     r_clear = _Dvar_RegisterEnum("r_clear", r_clearNames, 2, 0, "Controls how the color buffer is cleared");
     r_clearColor = _Dvar_RegisterColor(

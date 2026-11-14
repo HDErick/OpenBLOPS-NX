@@ -5821,11 +5821,6 @@ HRESULT IDirect3DDevice9::EvictManagedResources() { return D3D_OK; }
 static const dvar_s *s_glReportDvar;
 static bool nxGlFullReport() { return s_glReportDvar && s_glReportDvar->current.enabled; }
 
-// nx_vsync: EGL's default swap interval of 1 waits for the display's refresh,
-// so a frame that took 38 ms of render thread showed at 50 (or 33): ~11 ms a
-// frame went to eglSwapBuffers. Off by default; 1 brings the wait back (no
-// tearing, frame times rounded up to a multiple of 16.7 ms).
-static const dvar_s *s_vsyncDvar;
 static int s_vsyncApplied = -1;
 
 // GPU time per frame: a GL_TIME_ELAPSED query spans each frame's commands,
@@ -5990,7 +5985,7 @@ static void nxGlGpuTimerBegin(void)
     s_gpuQueryNext = (slot + 1) % NX_GPU_QUERIES;
 }
 
-HRESULT IDirect3DSwapChain9::Present(const RECT *, const RECT *, HWND, const void *, DWORD)
+HRESULT IDirect3DSwapChain9::Present(const RECT *, const RECT *, HWND, const void *, DWORD flags)
 {
     if (!s_glReportDvar)
         s_glReportDvar = _Dvar_RegisterBool("nx_glreport", false, 0,
@@ -6086,16 +6081,13 @@ HRESULT IDirect3DSwapChain9::Present(const RECT *, const RECT *, HWND, const voi
         s_boundFbo = ~0u;
     }
 
-    if (!s_vsyncDvar)
-        s_vsyncDvar = _Dvar_RegisterBool("nx_vsync", false, 0,
-                                         "Wait for the display refresh at each swap (no tearing, slower)");
     if (!s_glFlushDvar)
         s_glFlushDvar = _Dvar_RegisterInt("nx_glflush", 64, 0, 100000, 0,
                                           "glFlush every N draws so the GPU starts before the swap (0: off)");
     s_drawsSinceFlush = 0;
-    if ((int)s_vsyncDvar->current.enabled != s_vsyncApplied) {
-        s_vsyncApplied = s_vsyncDvar->current.enabled;
-        eglSwapInterval(s_display, s_vsyncApplied);
+    const int swapInterval = (flags & D3DPRESENT_FORCEIMMEDIATE) ? 0 : 1;
+    if (swapInterval != s_vsyncApplied && eglSwapInterval(s_display, swapInterval)) {
+        s_vsyncApplied = swapInterval;
         printf("[nx-gl] swap interval %d\n", s_vsyncApplied);
     }
     nxGlGpuTimerEnd();

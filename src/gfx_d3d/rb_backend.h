@@ -627,6 +627,9 @@ void __cdecl RB_BeginFrame(GfxBackEndData *data);
 const GfxBackEndData *RB_PatchStaticModelCache();
 void __cdecl RB_EndFrame(char drawType);
 void RB_SwapBuffers();
+#ifdef KISAK_NX
+void RB_SetVSync(bool enabled);
+#endif
 void RB_UpdateBackEndDvarOptions();
 void __cdecl RB_ExecuteRenderCommandsLoop(const void *cmds, int *ui3dTextureWindow);
 void __cdecl RB_Draw3D();

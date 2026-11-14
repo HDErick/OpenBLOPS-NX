@@ -152,7 +152,6 @@ if '    if (m_sCursor.Bitmap != nullptr)' in text:
     replace(str(file.relative_to(source)),text[start:end],'')
 replace('src/dxvk/dxvk_pipemanager.cpp', '          DxvkShaderCompileMethod::Dyasync));',
     '          DxvkShaderCompileMethod::Async));')
-
 replace('src/util/sync/sync_recursive.h',
     '''    std::atomic<uint32_t> m_owner   = { 0u };
     uint32_t              m_counter = { 0u };''',
@@ -192,4 +191,23 @@ replace('src/d3d9/d3d9_device.cpp',
     if constexpr (ProgramType == DxsoProgramType::VertexShader) {
       if constexpr (ConstantType == D3D9ConstantType::Float) {
         m_vsFloatConstsCount = std::max(m_vsFloatConstsCount, StartRegister + Count);''')
+
+replace('src/d3d9/d3d9_swapchain.cpp', '    m_dirty    |= vsync != m_vsync;\n', '')
+replace('src/d3d9/d3d9_swapchain.cpp',
+    '''    presenterDesc.numPresentModes = PickPresentModes(Vsync, presenterDesc.presentModes);
+    presenterDesc.fullScreenExclusive = PickFullscreenMode();
+
+    if (m_presenter->recreateSwapChain(presenterDesc) != VK_SUCCESS)''',
+    '''    presenterDesc.numPresentModes = PickPresentModes(false, presenterDesc.presentModes);
+    presenterDesc.fullScreenExclusive = PickFullscreenMode();
+
+    if (m_presenter->recreateSwapChain(presenterDesc) != VK_SUCCESS)''')
+replace('src/d3d9/d3d9_swapchain.cpp',
+    '''      m_context->beginRecording(
+        m_device->createCommandList());''',
+    '''      if (R_FAILED(nwindowSetSwapInterval(nwindowGetDefault(), SyncInterval != 0)))
+        throw DxvkError("D3D9SwapChainEx: Failed to set display swap interval");
+
+      m_context->beginRecording(
+        m_device->createCommandList());''')
 print('DXVK Sarek Horizon patches ready')
