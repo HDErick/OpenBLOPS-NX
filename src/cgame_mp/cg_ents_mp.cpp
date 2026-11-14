@@ -2402,7 +2402,13 @@ void __cdecl CG_ScriptMover(int localClientNum, centity_s *cent)
     s1 = &cent->nextState;
     if ( (cent->nextState.lerp.eFlags & 0x20) != 0 )
     {
-        if (cent->nextState.solid != 0xFFFFFF && (cent->nextState.clientLinkInfo.flags & 1) != 0)
+        // A hidden mover still needs its animated skeleton when something is
+        // linked to its tags or when it plays a scripted animation, e.g. a
+        // hidden player rig: its animation command arrives with the snapshot
+        // that spawns it, before the player is linked to it.
+        if (cent->nextState.solid != 0xFFFFFF
+            && ((cent->nextState.clientLinkInfo.flags & 1) != 0
+                || cent->nextState.lerp.u.scriptMover.animScriptedAnim))
         {
             CG_ScriptMover_GetDObj(localClientNum, cent);
         }
