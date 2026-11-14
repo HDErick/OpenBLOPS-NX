@@ -520,7 +520,13 @@ void    SCR_UpdateFrame()
     R_FoliageBeginFrame();
 #endif
 
+#ifdef KISAK_SP
+    // Retail SP 0x007A17D0: pausable sounds stop while the client is paused,
+    // except in an online or system link game.
+    v5 = !onlinegame->current.enabled && !Dvar_GetBool("systemlink") && cl_paused->current.integer != 0;
+#else
     v5 = Demo_IsPaused() || Demo_IsCompleted() || Demo_GetClipPausedState();
+#endif
     if ( Demo_IsPlaying() && CL_LocalClient_IsCUIFlagSet(0, 32) )
         seed = CG_GetLocalClientGlobals(0)->latestSnapshotNum;
     else
