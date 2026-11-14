@@ -81,6 +81,7 @@ const dvar_s *aim_scale_view_axis;
 const dvar_s *aim_assist_script_disable;
 const dvar_s *aim_assist_min_target_distance;
 const dvar_s *nx_aimassist;
+const dvar_s *nx_aimacceleration;
 
 
 #ifdef KISAK_SP
@@ -127,6 +128,9 @@ void AimAssist_RegisterDvars()
     nx_aimassist = _Dvar_RegisterBool(
         "nx_aimassist", 1, 0x1u,
         "Gamepad aim assist (slowdown, lock-on and ADS snap) for all local players");
+    nx_aimacceleration = _Dvar_RegisterBool(
+        "nx_aimacceleration", 1, 0x1u,
+        "Gamepad turn acceleration: the right stick ramps up to full turn speed (off: full speed at once)");
     const dvar_s *result; // eax
 
     aim_aimAssistRangeScale = _Dvar_RegisterFloat(
@@ -1243,7 +1247,9 @@ void __cdecl AimAssist_ApplyTurnRates(const AimInput *input, AimOutput *output)
     pitchDelta = fabs(adjustedPitchAxis) * pitchTurnRate;
     //yawDelta = fabs(adjustedYawAxis) * yawTurnRate;
     yawDelta = fabs(adjustedYawAxis) * yawTurnRate;
-    if ( !aim_accel_turnrate_enabled->current.enabled || aim_assist_script_disable->current.enabled )
+    if ( !aim_accel_turnrate_enabled->current.enabled
+        || !nx_aimacceleration->current.enabled
+        || aim_assist_script_disable->current.enabled )
     {
         aaGlob->pitchDelta = pitchDelta;
         aaGlob->yawDelta = yawDelta;

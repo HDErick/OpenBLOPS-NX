@@ -132,7 +132,21 @@ int main(){
  AimAssist_UpdateSplitGuestInput(&player,&command,.016f,0,.5f,raw,true);assert(aaGlobArray[1].lockOnTargetEnt==11);
  auto host=aaGlobArray[0];AimAssist_ResetSplitGuest();assert(!aaGlobArray[1].initialized&&atGlobArray[1].targetCount==0&&!memcmp(&host,&aaGlobArray[0],sizeof(host)));
  guestView=false;assert(!AimAssist_UpdateSplitGuestInput(&player,&command,.016f,0,0,raw,true));
- puts("PASS: native P2 slowdown/ADS snap/lock-on, shared live toggle, private distant targets, walls/smoke and cleanup");
+ // Turn acceleration: on by default (the original ramp); off turns at the full rate at once.
+ vars["aim_slowdown_enabled"].current.enabled=false;vars["aim_accel_turnrate_enabled"].current.enabled=true;
+ assert(vars["nx_aimacceleration"].current.enabled);
+ auto turn=[&](bool acceleration,int frames){
+  vars["nx_aimacceleration"].current.enabled=acceleration;memset(&aaGlobArray[1],0,sizeof(aaGlobArray[1]));aaGlobArray[1].fovTurnRateScale=1;
+  AimInput in{};in.localClientNum=1;in.deltaTime=.016f;in.yawAxis=1;AimOutput out{};
+  for(int i=0;i<frames;++i)AimAssist_ApplyTurnRates(&in,&out);
+  return out.yaw;};
+ const float rampedFirst=turn(true,1),directFirst=turn(false,1);
+ assert(rampedFirst>0&&directFirst>rampedFirst*2);         // full stick: the ramp starts slow, direct is at full rate
+ assert(fabs(turn(false,10)-directFirst*10)<1e-3f);         // direct: the same turn every frame
+ assert(turn(true,200)>turn(true,1)*200);                   // ramped: speeds up while the stick is held
+ vars["aim_accel_turnrate_enabled"].current.enabled=false;assert(fabs(turn(true,1)-directFirst)<1e-4f); // dev dvar still disables the ramp
+ vars["aim_accel_turnrate_enabled"].current.enabled=true;vars["nx_aimacceleration"].current.enabled=true;
+ puts("PASS: native P2 slowdown/ADS snap/lock-on, shared live toggle, private distant targets, walls/smoke, cleanup and turn acceleration setting");
 }
 """
 for mode in ['sp','mp']:

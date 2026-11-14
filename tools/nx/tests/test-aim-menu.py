@@ -15,7 +15,7 @@ code=r"""
 #define __cdecl
 #define ARRAY_COUNT(a) (sizeof(a)/sizeof(a[0]))
 int I_stricmp(const char*a,const char*b){return strcmp(a,b);}
-struct rectDef_s{float x=0,y=0,w=100,h=20;};struct textDef_s{const char*text=nullptr;void*textExpData=nullptr;rectDef_s textRect[1];};
+struct rectDef_s{float x=0,y=0,w=100,h=20;int horzAlign=0,vertAlign=0;};struct textDef_s{const char*text=nullptr;void*textExpData=nullptr;rectDef_s textRect[1];float textalignx=0,textaligny=0,textscale=.3f;};
 struct GenericEventHandler{const char*name=nullptr;GenericEventHandler*next=nullptr;};
 struct UIAnimState{rectDef_s rectClient;};struct UIAnimInfo{int animStateCount=0;UIAnimState**animStates=nullptr;UIAnimState currentAnimState,nextAnimState;};
 struct menuDef_t;
@@ -24,7 +24,7 @@ struct menuDef_t{struct{const char*name="options_gamepad";}window;int itemCount=
 bool focused=false;bool Window_HasFocus(int,const decltype(itemDef_s::window)*){return focused;}
 """
 code+=function('src/ui/ui_utils.cpp','int __cdecl Item_IsTextDefType(')+'\n'
-for sig in ['static itemDef_s *UI_NX_FindItem(', 'static bool UI_NX_ItemNamed(', 'static itemDef_s *UI_NX_FindItemByDvar(', 'static void UI_NX_MoveItem(', 'static itemDef_s *UI_NX_CloneItem(', 'bool UI_NX_IsHiddenAimAssistHighlight(', 'static void UI_NX_AddAimAssistOption(']:
+for sig in ['static itemDef_s *UI_NX_FindItem(', 'static bool UI_NX_ItemNamed(', 'static itemDef_s *UI_NX_FindItemByDvar(', 'static void UI_NX_MoveItem(', 'static itemDef_s *UI_NX_CloneItem(', 'bool UI_NX_IsHiddenAimAssistHighlight(', 'static int UI_NX_CloneInvertRow(', 'static void UI_NX_ScaleRectAbout(', 'static void UI_NX_ScaleItem(', 'static void UI_NX_FitGamepadDiagram(', 'static void UI_NX_AddAimAssistOption(']:
  # The add function has an earlier forward declaration; select definition.
  s=(root/'src/ui/ui_shared.cpp').read_text()
  if sig.startswith('static void UI_NX_AddAimAssistOption'):
@@ -41,14 +41,25 @@ int main(){
  highlight.window.name="invert_hl";highlight.visibleExp.numRpn=2;
  buttons.dvar="gpad_buttonsConfig";buttons.window.rect.y=40;sensitivity.dvar="input_viewSensitivity";sensitivity.window.rect.y=70;
  itemDef_s*original[]{&label,&choice,&highlight,&buttons,&sensitivity};menu.items=original;menu.itemCount=5;
- UI_NX_AddAimAssistOption(&menu);assert(menu.itemCount==8);
+ UI_NX_AddAimAssistOption(&menu);assert(menu.itemCount==11);
  auto option=UI_NX_FindItem(&menu,"options_gamepad_nx_aimassist",nullptr);assert(option&&strcmp(option->dvar,"nx_aimassist")==0&&option->window.rect.y==100);
  assert(option->onEvent&&strcmp(option->onEvent->name,"leavefocus")==0);
+ auto accel=UI_NX_FindItem(&menu,"options_gamepad_nx_aimaccel",nullptr);assert(accel&&strcmp(accel->dvar,"nx_aimacceleration")==0&&accel->window.rect.y==130);
+ assert(accel->onEvent&&strcmp(accel->onEvent->name,"leavefocus")==0);
  assert(strcmp(choice.dvar,"input_invertpitch")==0&&strcmp(labelText.text,"LOOK INVERSION")==0);
- auto hl=UI_NX_FindItem(&menu,"options_gamepad_nx_aimassist_hl",nullptr);assert(hl&&UI_NX_IsHiddenAimAssistHighlight(0,hl));focused=true;assert(!UI_NX_IsHiddenAimAssistHighlight(0,hl));
- bool ownLabel=false;for(int i=0;i<menu.itemCount;++i)if(menu.items[i]->typeData.textDef&&menu.items[i]!=&label)ownLabel=strcmp(menu.items[i]->typeData.textDef->text,"AIM ASSIST")==0;
- assert(ownLabel);UI_NX_AddAimAssistOption(&menu);assert(menu.itemCount==8);
- puts("PASS: PC gamepad Aim Assist row, shared master binding, intact source controls and highlight/idempotency");
+ auto hl=UI_NX_FindItem(&menu,"options_gamepad_nx_aimassist_hl",nullptr);assert(hl&&UI_NX_IsHiddenAimAssistHighlight(0,hl));
+ auto accelHl=UI_NX_FindItem(&menu,"options_gamepad_nx_aimaccel_hl",nullptr);assert(accelHl&&accelHl->window.rect.y==130&&UI_NX_IsHiddenAimAssistHighlight(0,accelHl));
+ focused=true;assert(!UI_NX_IsHiddenAimAssistHighlight(0,hl)&&!UI_NX_IsHiddenAimAssistHighlight(0,accelHl));
+ int assistLabels=0,accelLabels=0,assistIndex=-1,accelIndex=-1;
+ for(int i=0;i<menu.itemCount;++i){
+  auto*item=menu.items[i];if(item==option)assistIndex=i;if(item==accel)accelIndex=i;
+  if(!item->typeData.textDef||item==&label||item==&choice)continue;
+  if(item->typeData.textDef->text&&!strcmp(item->typeData.textDef->text,"AIM ASSIST"))++assistLabels,assert(item->window.rect.y==100);
+  if(item->typeData.textDef->text&&!strcmp(item->typeData.textDef->text,"AIM ACCELERATION"))++accelLabels,assert(item->window.rect.y==130);
+ }
+ assert(assistLabels==1&&accelLabels==1&&assistIndex>=0&&accelIndex>assistIndex); // D-pad order: sensitivity, aim assist, acceleration
+ UI_NX_AddAimAssistOption(&menu);assert(menu.itemCount==11);
+ puts("PASS: gamepad Aim Assist and Aim Acceleration rows, dvar bindings, intact source controls, order and highlight/idempotency");
 }
 """
 cpp=out/'menu.cpp';cpp.write_text(code);exe=cpp.with_suffix('.exe');subprocess.run([args.compiler,'-std=c++17','-w',str(cpp),'-o',str(exe)],check=True);subprocess.run([str(exe)],check=True)

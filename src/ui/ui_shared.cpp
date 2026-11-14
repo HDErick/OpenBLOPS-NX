@@ -11409,6 +11409,8 @@ bool UI_NX_IsHiddenAimAssistHighlight(int contextIndex, const itemDef_s *item)
     const char *choice = nullptr;
     if ( !I_stricmp(item->window.name, "options_gamepad_nx_aimassist_hl") )
         choice = "options_gamepad_nx_aimassist";
+    else if ( !I_stricmp(item->window.name, "options_gamepad_nx_aimaccel_hl") )
+        choice = "options_gamepad_nx_aimaccel";
     else if ( !I_stricmp(item->window.name, "options_graphics_performance_hl") )
         choice = "options_graphics_performance";
     else if ( !I_stricmp(item->window.name, "openblops_host_maxplayers_hl") )
@@ -11422,16 +11424,124 @@ bool UI_NX_IsHiddenAimAssistHighlight(int contextIndex, const itemDef_s *item)
     return true;
 }
 
-// Controls > Gamepad ("options_gamepad", code_post_gfx) gets an AIM ASSIST
-// row for nx_aimassist (aim_assist.cpp, archived, default 1), copied from the
-// look inversion row and placed one row below look sensitivity. That row is
-// five items on one rect: a dim backing and a white label (always shown), a
-// white box and a black label (shown while the row is highlighted, by an
-// expression on that row's ui_highlight number), and the choice, a multi item
-// bound to input_invertpitch (Disabled / Enabled = 0 / 1) that draws only the
-// value. Only the last two are named. All five are copied in draw order; the
-// labels get fixed text, and the highlight pair follows the copied choice's
-// focus (UI_NX_IsHiddenAimAssistHighlight).
+// Controls > Gamepad ("options_gamepad", code_post_gfx) gets two rows copied
+// from the look inversion row: AIM ASSIST for nx_aimassist one row below look
+// sensitivity, and AIM ACCELERATION for nx_aimacceleration one row below that
+// (both aim_assist.cpp, archived, default 1). The look inversion row is five
+// items on one rect: a dim backing and a white label (always shown), a white
+// box and a black label (shown while the row is highlighted, by an expression
+// on that row's ui_highlight number), and the choice, a multi item bound to
+// input_invertpitch (Disabled / Enabled = 0 / 1) that draws only the value.
+// Only the last two are named. All five are copied in draw order; the labels
+// get fixed text, and the highlight pair follows the copied choice's focus
+// (UI_NX_IsHiddenAimAssistHighlight).
+static int UI_NX_CloneInvertRow(menuDef_t *menu, const itemDef_s *invert, const itemDef_s *label, float dy,
+                                const char *choiceName, const char *highlightName, const char *rowName,
+                                const char *dvar, const char *text, itemDef_s **added, int capacity)
+{
+    int addedCount = 0;
+    for ( int i = 0; i < menu->itemCount && addedCount < capacity; ++i )
+    {
+        const itemDef_s *src = menu->items[i];
+        const bool isChoice = src == invert;
+        const bool onLabelRect = src && src->window.rect.x == label->window.rect.x
+            && src->window.rect.y == label->window.rect.y && src->window.rect.w == label->window.rect.w
+            && src->window.rect.h == label->window.rect.h;
+        if ( !isChoice && !onLabelRect )
+            continue;
+        const bool highlight = !isChoice && src->visibleExp.numRpn != invert->visibleExp.numRpn;
+        const char *name = isChoice ? choiceName : highlight ? highlightName : rowName;
+        itemDef_s *copy = UI_NX_CloneItem(menu, src, name, dy, isChoice);
+        if ( !copy )
+            continue;
+        if ( isChoice )
+            copy->dvar = dvar;
+        if ( highlight )
+            copy->visibleExp = invert->visibleExp;   // the row's condition; the focus test is in code
+        if ( !isChoice && Item_IsTextDefType(copy) && copy->typeData.textDef )
+        {
+            copy->typeData.textDef->text = text;
+            copy->typeData.textDef->textExpData = nullptr;
+        }
+        added[addedCount++] = copy;
+    }
+    return addedCount;
+}
+
+static void UI_NX_ScaleRectAbout(rectDef_s *rect, float cx, float cy, float scale)
+{
+    rect->x = cx + (rect->x - cx) * scale;
+    rect->y = cy + (rect->y - cy) * scale;
+    rect->w *= scale;
+    rect->h *= scale;
+}
+
+// Scales an item, text included, about (cx, cy) in rect's coordinates. The
+// client, text and animation rects may be offset from rect, so they scale
+// about the same point moved by that offset.
+static void UI_NX_ScaleItem(itemDef_s *item, float cx, float cy, float scale)
+{
+    const float clientX = cx + item->window.rectClient.x - item->window.rect.x;
+    const float clientY = cy + item->window.rectClient.y - item->window.rect.y;
+    UI_NX_ScaleRectAbout(&item->window.rect, cx, cy, scale);
+    UI_NX_ScaleRectAbout(&item->window.rectClient, clientX, clientY, scale);
+    if ( Item_IsTextDefType(item) && item->typeData.textDef )
+    {
+        textDef_s *text = item->typeData.textDef;
+        UI_NX_ScaleRectAbout(&text->textRect[0], clientX, clientY, scale);
+        text->textalignx *= scale;
+        text->textaligny *= scale;
+        text->textscale *= scale;
+    }
+    if ( UIAnimInfo *anim = item->animInfo )
+    {
+        for ( int s = 0; s < anim->animStateCount; ++s )
+            if ( anim->animStates && anim->animStates[s] )
+                UI_NX_ScaleRectAbout(&anim->animStates[s]->rectClient, clientX, clientY, scale);
+        UI_NX_ScaleRectAbout(&anim->currentAnimState.rectClient, clientX, clientY, scale);
+        UI_NX_ScaleRectAbout(&anim->nextAnimState.rectClient, clientX, clientY, scale);
+    }
+}
+
+// The controller diagram (every top-aligned item of the gamepad menu: the
+// picture, its leader lines and layout labels) is placed from the top of the
+// 480-unit virtual screen and the rows from its centre, so the added rows
+// cover its top. Shrink it toward the middle of its bottom edge until it
+// starts just below rowsBottom; its bottom stays inside the panel.
+static void UI_NX_FitGamepadDiagram(menuDef_t *menu, float rowsBottom, int rowsVertAlign)
+{
+    constexpr int kAlignTop = 1, kAlignCenter = 2;   // rectDef_s::vertAlign
+    constexpr float kScreenCenterY = 240.0f, kGap = 4.0f, kMinScale = 0.6f;
+    if ( rowsVertAlign != kAlignCenter )
+        return;
+    float minX = 1e30f, maxX = -1e30f, minY = 1e30f, maxY = -1e30f;
+    int count = 0;
+    for ( int i = 0; i < menu->itemCount; ++i )
+    {
+        const itemDef_s *item = menu->items[i];
+        if ( !item || item->window.rect.vertAlign != kAlignTop )
+            continue;
+        const rectDef_s &r = item->window.rect;   // leader lines can have negative sizes
+        const float x0 = r.w < 0 ? r.x + r.w : r.x, x1 = r.w < 0 ? r.x : r.x + r.w;
+        const float y0 = r.h < 0 ? r.y + r.h : r.y, y1 = r.h < 0 ? r.y : r.y + r.h;
+        if ( x0 < minX ) minX = x0;
+        if ( x1 > maxX ) maxX = x1;
+        if ( y0 < minY ) minY = y0;
+        if ( y1 > maxY ) maxY = y1;
+        ++count;
+    }
+    const float top = kScreenCenterY + rowsBottom + kGap;
+    if ( !count || minY >= top || maxY <= top )
+        return;
+    const float scale = (maxY - top) / (maxY - minY);
+    if ( scale < kMinScale )
+        return;   // not the expected layout; leave it as supplied
+    const float cx = (minX + maxX) * 0.5f;
+    for ( int i = 0; i < menu->itemCount; ++i )
+        if ( menu->items[i] && menu->items[i]->window.rect.vertAlign == kAlignTop )
+            UI_NX_ScaleItem(menu->items[i], cx, maxY, scale);
+}
+
 static void UI_NX_AddAimAssistOption(menuDef_t *menu)
 {
     if ( !menu || !menu->window.name || I_stricmp(menu->window.name, "options_gamepad") )
@@ -11461,38 +11571,17 @@ static void UI_NX_AddAimAssistOption(menuDef_t *menu)
             lastIndex = i;
     if ( lastIndex < 0 )
         return;
-    // invert's row -> one row below sensitivity, at the spacing of the rows above
-    const float dy = sensitivity->window.rect.y + (sensitivity->window.rect.y - buttons->window.rect.y)
-                   - invert->window.rect.y;
+    // invert's row -> one and two rows below sensitivity, at the spacing of the rows above
+    const float rowStep = sensitivity->window.rect.y - buttons->window.rect.y;
+    const float dy = sensitivity->window.rect.y + rowStep - invert->window.rect.y;
 
-    itemDef_s *added[8] = {};
-    int addedCount = 0;
-    for ( int i = 0; i < menu->itemCount && addedCount < (int)ARRAY_COUNT(added); ++i )
-    {
-        const itemDef_s *src = menu->items[i];
-        const bool isChoice = src == invert;
-        const bool onLabelRect = src && src->window.rect.x == label->window.rect.x
-            && src->window.rect.y == label->window.rect.y && src->window.rect.w == label->window.rect.w
-            && src->window.rect.h == label->window.rect.h;
-        if ( !isChoice && !onLabelRect )
-            continue;
-        const bool highlight = !isChoice && src->visibleExp.numRpn != invert->visibleExp.numRpn;
-        const char *name = isChoice ? "options_gamepad_nx_aimassist"
-                         : highlight ? "options_gamepad_nx_aimassist_hl" : "options_gamepad_nx_aimassist_row";
-        itemDef_s *copy = UI_NX_CloneItem(menu, src, name, dy, isChoice);
-        if ( !copy )
-            continue;
-        if ( isChoice )
-            copy->dvar = "nx_aimassist";
-        if ( highlight )
-            copy->visibleExp = invert->visibleExp;   // the row's condition; the focus test is in code
-        if ( !isChoice && Item_IsTextDefType(copy) && copy->typeData.textDef )
-        {
-            copy->typeData.textDef->text = "AIM ASSIST";
-            copy->typeData.textDef->textExpData = nullptr;
-        }
-        added[addedCount++] = copy;
-    }
+    itemDef_s *added[16] = {};
+    int addedCount = UI_NX_CloneInvertRow(menu, invert, label, dy, "options_gamepad_nx_aimassist",
+        "options_gamepad_nx_aimassist_hl", "options_gamepad_nx_aimassist_row", "nx_aimassist", "AIM ASSIST",
+        added, (int)ARRAY_COUNT(added));
+    addedCount += UI_NX_CloneInvertRow(menu, invert, label, dy + rowStep, "options_gamepad_nx_aimaccel",
+        "options_gamepad_nx_aimaccel_hl", "options_gamepad_nx_aimaccel_row", "nx_aimacceleration",
+        "AIM ACCELERATION", added + addedCount, (int)ARRAY_COUNT(added) - addedCount);
     if ( !addedCount )
         return;
 
@@ -11505,6 +11594,8 @@ static void UI_NX_AddAimAssistOption(menuDef_t *menu)
            (menu->itemCount - lastIndex - 1) * sizeof(itemDef_s *));
     menu->items = items;   // the zone's array stays as it was; this one lives as long as the menu
     menu->itemCount += addedCount;
+    UI_NX_FitGamepadDiagram(menu, invert->window.rect.y + dy + rowStep + invert->window.rect.h,
+                            invert->window.rect.vertAlign);
 }
 
 // Graphics is supplied by three zones (SP, MP frontend, MP in-game). Clone
