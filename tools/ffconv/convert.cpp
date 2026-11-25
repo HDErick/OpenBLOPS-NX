@@ -1,5 +1,5 @@
-// convert.cpp -- offline 32->64-bit fastfile converter (Stage 1: rawfile,
-// stringtable, localize). Reads a shipped .ff, transcodes each asset from its
+// convert.cpp -- offline 32->64-bit fastfile converter.
+// Reads a shipped .ff, transcodes each asset from its
 // x86 (4-byte-pointer) layout into a native-LP64 "prelinked zone" (KBZ1) that
 // the on-device generic relocator consumes.
 //
@@ -33,18 +33,21 @@ static std::vector<uint8_t> readFile(const char *path) {
 static std::vector<uint8_t> inflateAll(const uint8_t *src, size_t srcLen) {
     std::vector<uint8_t> out(1 << 20);
     z_stream zs; memset(&zs, 0, sizeof(zs));
-    inflateInit(&zs);
+    if (inflateInit(&zs) != Z_OK) return {};
     zs.next_in = (Bytef *)src; zs.avail_in = (uInt)srcLen;
+    int status;
     for (;;) {
         if (zs.total_out >= out.size()) out.resize(out.size() * 2);
         zs.next_out = out.data() + zs.total_out;
         zs.avail_out = (uInt)(out.size() - zs.total_out);
-        int r = inflate(&zs, Z_NO_FLUSH);
-        if (r == Z_STREAM_END) break;
-        if (r != Z_OK) break;
+        status = inflate(&zs, Z_NO_FLUSH);
+        if (status != Z_OK) break;
         if (zs.avail_in == 0 && zs.avail_out != 0) break;
     }
-    out.resize(zs.total_out); inflateEnd(&zs); return out;
+    out.resize(zs.total_out);
+    inflateEnd(&zs);
+    if (status != Z_STREAM_END) return {};
+    return out;
 }
 
 // ---- block-4 x86 memory emulation (for de-dup pointer resolution) -----------
@@ -2363,7 +2366,7 @@ static Prelink::Loc tMenuDef(Reader &r, Prelink &z, Prelink::Loc obj, uint32_t f
     int32_t itemCount;
     memcpy(&itemCount, ints15 + 8, 4);
 
-    z.putPtr(obj, field, m);
+    if (obj.valid()) z.putPtr(obj, field, m);
 
     // --- referenced data, in Load_menuDef_t order ---
     mtrace(r, "menuDef itemCount", itemCount, wt.name);
@@ -4813,6 +4816,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "not an IWff zone\n"); return 1;
     }
     std::vector<uint8_t> zone = inflateAll(file.data() + 12, file.size() - 12);
+    if (zone.size() < 52) {
+        fprintf(stderr, "invalid or truncated fastfile stream\n");
+        return 4;
+    }
     uint32_t blockSize4; memcpy(&blockSize4, zone.data() + 8 + 4 * 4, 4); // XFile.blockSize[4]
     Reader r(zone.data() + 36, zone.size() - 36);                          // skip XFile header
 
@@ -4882,6 +4889,21 @@ int main(int argc, char **argv) {
     for (uint32_t i = 0; i < assetCount; ++i) {
         const uint8_t *pre = r.p;
         g_curAsset = (int)i;
+        // The top-level XAsset header is itself loaded as an asset pointer.
+        // Retail zones usually use -1 here. OpenAssetTools emits -2 and
+        // reserves an alias slot before writing the asset's referenced data.
+        const uint32_t headerSlot = assetArrayOff + i * 8 + 4;
+        if (hdrTag[i] != TAG_INLINE && hdrTag[i] != TAG_ALIAS) {
+            const uint32_t offset = hdrTag[i] - 1;
+            const auto target = g_aliasMap.find(offset & 0x1FFFFFFF);
+            if ((offset >> 29) != 4 || target == g_aliasMap.end()) {
+                fprintf(stderr, "invalid asset header reference %08x at index %u\n", hdrTag[i], i);
+                return 4;
+            }
+            noteAliasSlot(headerSlot, target->second);
+            continue;
+        }
+        const uint32_t inserted = hdrTag[i] == TAG_ALIAS ? insertPointerSlot() : 0;
         switch (types[i]) {
         case AT_RAWFILE:     { Prelink::Loc o = z.alloc(OUT, 24, 8); tRawFile(r, z, o);      z.addAsset(AT_RAWFILE, o); break; }
         case AT_STRINGTABLE: { Prelink::Loc o = z.alloc(OUT, 32, 8); tStringTable(r, z, o);  z.addAsset(AT_STRINGTABLE, o); break; }
@@ -4896,6 +4918,7 @@ int main(int argc, char **argv) {
         case AT_XANIM:       { Prelink::Loc o = z.alloc(OUT, SZ_XANIM, 8); tXAnimParts(r, z, o); z.addAsset(AT_XANIM, o); break; }
         case AT_XMODEL:      { Prelink::Loc o = z.alloc(OUT, SZ_XMODEL, 8); tXModel(r, z, o); z.addAsset(AT_XMODEL, o); break; }        
         case AT_MENUFILE:    { Prelink::Loc o = z.alloc(OUT, SZ_MENULIST, 8); tMenuList(r, z, o); z.addAsset(AT_MENUFILE, o); break; }
+        case AT_MENU:        { z.addAsset(AT_MENU, tMenuDef(r, z, Prelink::none(), 0)); break; }
         case AT_FX:          { Prelink::Loc o = z.alloc(OUT, SZ_FXEFFECTDEF, 8); tFxEffectDef(r, z, o); z.addAsset(AT_FX, o); break; }
         case AT_WEAPON:      { Prelink::Loc o = z.alloc(OUT, SZ_WEAPONVARIANTDEF, 8); tWeaponVariantDef(r, z, o); z.addAsset(AT_WEAPON, o); break; }
         case AT_IMPACTFX:    { Prelink::Loc o = z.alloc(OUT, SZ_FXIMPACTTABLE, 8); tFxImpactTable(r, z, o); z.addAsset(AT_IMPACTFX, o); break; }
@@ -4917,7 +4940,7 @@ int main(int argc, char **argv) {
         case AT_CLIPMAP: { Prelink::Loc o = z.alloc(OUT, L_sizeof_clipMap_t, 8); tClipMap(r, z, o); z.addAsset(AT_CLIPMAP, o); break; }
         case AT_GLASSES:     { Prelink::Loc o = z.alloc(OUT, L_sizeof_Glasses, 8); tGlasses(r, z, o); z.addAsset(AT_GLASSES, o); break; }
         default:
-            fprintf(stderr, "unsupported asset type %u at index %u (Stage 1 = rawfile/stringtable/localize)\n", types[i], i);
+            fprintf(stderr, "unsupported asset type %u at index %u\n", types[i], i);
             return 3;
         }
         if (dbg)
@@ -4928,7 +4951,9 @@ int main(int argc, char **argv) {
         // what a later DB_ConvertOffsetToAlias reference dereferences.
         if (!z.assets.empty()) {
             const Prelink::AssetRef &a = z.assets.back();
-            g_aliasMap[assetArrayOff + i * 8 + 4] = Prelink::Loc{(int)a.blk, a.off};
+            const Prelink::Loc location{(int)a.blk, a.off};
+            noteAliasSlot(headerSlot, location);
+            noteAliasSlot(inserted, location);
         }
     }
 
@@ -4950,9 +4975,14 @@ int main(int argc, char **argv) {
         }
     }
 
-    z.write(argv[2]);
     bool b4ok = (g_x86b4 == blockSize4);
-    printf("converted %s -> %s\n", argv[1], argv[2]);
+    const bool valid = b4ok && missing == 0 && g_aliasBad == 0;
+    if (valid) {
+        z.write(argv[2]);
+        printf("converted %s -> %s\n", argv[1], argv[2]);
+    } else {
+        printf("could not convert %s: block cursor or references did not validate\n", argv[1]);
+    }
     printf("  assets=%u  relocs=%zu  outBlock=%zu bytes  streamPos=%zu/%zu\n",
            assetCount, z.relocs.size(), z.block[OUT].size(), (size_t)(r.p - zone.data()), zone.size());
     printf("  block4 x86 cursor=%u  header blockSize[4]=%u  %s\n",
@@ -4977,7 +5007,7 @@ int main(int argc, char **argv) {
         if (g_sndFormatCount[f])
             printf("  loaded sounds, format %d: %u, %llu bytes\n", f, g_sndFormatCount[f],
                    (unsigned long long)g_sndFormatBytes[f]);
-    return (b4ok && missing == 0 && g_aliasBad == 0) ? 0 : 5;
+    return valid ? 0 : 5;
 }
 
 // KBZ1 writer.
