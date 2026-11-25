@@ -419,6 +419,9 @@ const dvar_s *r_open_automate;
 const dvar_s *r_gfxopt_dynamic_foliage;
 const dvar_s *r_gfxopt_water_simulation;
 const dvar_s *r_allow_intz;
+#ifdef NX_DXVK
+const dvar_s *r_intzSharedDepth;
+#endif
 const dvar_s *r_allow_null_rt;
 const dvar_s *r_use_driver_convergence;
 const dvar_s *r_convergence;
@@ -2699,6 +2702,14 @@ void __cdecl R_RegisterDvars()
                                                              "Enable tree rustle, grass wind react etc");
     r_gfxopt_water_simulation = _Dvar_RegisterBool("r_gfxopt_water_simulation", 1, 1u, "Enable advanced water simulation");
     r_allow_intz = _Dvar_RegisterBool("r_allow_intz", 1, 1u, "Enable support for the intz depth buffer format.");
+#ifdef NX_DXVK
+    // Off: floatz is its own INTZ texture, copied from the scene's depth buffer
+    // once the opaque scene is drawn (RESZ). On: floatz is the depth buffer
+    // itself, which saves that copy, but water and mud then sample the depth
+    // buffer they are drawn against and do not render on the Switch's GPU.
+    r_intzSharedDepth = _Dvar_RegisterBool(
+        "r_intzSharedDepth", 0, 0, "Use the scene's depth buffer as the floatz texture instead of a copy of it.");
+#endif
     r_allow_null_rt = _Dvar_RegisterBool("r_allow_null_rt", 1, 1u, "Enable support for the null render target format.");
     r_use_driver_convergence = _Dvar_RegisterBool(
                                                              "r_use_driver_convergence",

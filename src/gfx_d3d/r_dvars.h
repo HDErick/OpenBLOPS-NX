@@ -420,6 +420,9 @@ extern const dvar_s *r_open_automate;
 extern const dvar_s *r_gfxopt_dynamic_foliage;
 extern const dvar_s *r_gfxopt_water_simulation;
 extern const dvar_s *r_allow_intz;
+#ifdef NX_DXVK
+extern const dvar_s *r_intzSharedDepth;
+#endif
 extern const dvar_s *r_allow_null_rt;
 extern const dvar_s *r_use_driver_convergence;
 extern const dvar_s *r_convergence;

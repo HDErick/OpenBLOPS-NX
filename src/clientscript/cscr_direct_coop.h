@@ -20,13 +20,19 @@ inline bool Scr_PatchDirectCoopSource(const char *filename, std::string &source)
         return true;
     };
     // Reject unknown/modded bodies atomically rather than applying half a fix.
+    // The two files are adjusted independently: _callbackglobal reaches the
+    // late-join thread through a level pointer that only the _zombiemode
+    // adjustment sets, so it still compiles where that version of
+    // _zombiemode is not recognized (a game without the retail patch zones).
+    // Late join then never starts: kisak_direct_roster_ready is unset too.
     if (callbacks)
     {
         if (!replaceOnce("self thread[[level.spawnClient]]();", R"gsc(self.kisak_direct_late_join = IsDefined( level.kisak_direct_roster_ready ) &&
+        IsDefined( level.kisak_direct_wait_for_round ) &&
         !IsDefined( self.kisak_direct_initial_player );
     self.kisak_direct_waiting_round = self.kisak_direct_late_join;
     if ( self.kisak_direct_late_join )
-        self thread maps\_zombiemode::kisak_direct_wait_for_round();
+        self thread [[level.kisak_direct_wait_for_round]]();
     else
         self thread[[level.spawnClient]]();)gsc")
             || !replaceOnce("if( IsDefined( level.custom_spawnPlayer ) )", R"gsc(if( IsDefined( level.custom_spawnPlayer ) &&
@@ -40,6 +46,7 @@ inline bool Scr_PatchDirectCoopSource(const char *filename, std::string &source)
                 R"gsc(direct_players = get_players();
     for ( direct_i = 0; direct_i < direct_players.size; direct_i++ )
         direct_players[direct_i].kisak_direct_initial_player = true;
+    level.kisak_direct_wait_for_round = ::kisak_direct_wait_for_round;
     level.kisak_direct_roster_ready = true;
     println( "sessions: mapname=", level.script, " gametype zom isserver 1 player_count=", get_players().size );)gsc")
             || !replaceOnce("self freezecontrols( true ); // first spawn only, intro_black_screen will pull them out of it", R"gsc(if ( !IsDefined( self.kisak_direct_late_join ) || !self.kisak_direct_late_join )

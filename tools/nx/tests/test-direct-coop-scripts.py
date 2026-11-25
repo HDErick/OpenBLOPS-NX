@@ -84,6 +84,8 @@ for fixture in fixtures:
         assert text.index('level waittill( "end_of_round" );', text.index('kisak_direct_wait_for_round()')) < text.index('self.kisak_direct_waiting_round = false;')
         assert text.index('flag_wait( "all_players_connected" );') < text.index('direct_players[direct_i].kisak_direct_initial_player = true;')
         assert text.index('direct_players[direct_i].kisak_direct_initial_player = true;') < text.index('level.kisak_direct_roster_ready = true;')
+        # _callbackglobal reaches the late-join thread only through this pointer.
+        assert text.index('level.kisak_direct_wait_for_round = ::kisak_direct_wait_for_round;') < text.index('level.kisak_direct_roster_ready = true;')
         assert 'points[index % points.size]' in text
         assert 'self.is_zombie = false;' in text
         assert text.count('self kisak_direct_set_spawn_points();') == 2
@@ -100,9 +102,14 @@ for fixture in fixtures:
         assert 'self waittill( "spawned_spectator" );' in text
         assert text.index('self.sessionstate = "playing";', text.index('kisak_direct_wait_for_round()')) < text.index('self.kisak_direct_waiting_round = false;')
     else:
-        classification = 'IsDefined( level.kisak_direct_roster_ready ) &&\n        !IsDefined( self.kisak_direct_initial_player )'
+        classification = ('IsDefined( level.kisak_direct_roster_ready ) &&\n'
+                          '        IsDefined( level.kisak_direct_wait_for_round ) &&\n'
+                          '        !IsDefined( self.kisak_direct_initial_player )')
         assert classification in text
-        assert text.index(classification) < text.index('self thread maps\\_zombiemode::kisak_direct_wait_for_round();')
+        assert text.index(classification) < text.index('self thread [[level.kisak_direct_wait_for_round]]();')
+        # No direct reference into _zombiemode: that file may be a version the
+        # adjustment does not recognize, and the call would not compile.
+        assert 'maps\\_zombiemode::kisak_direct_wait_for_round' not in text
     count += 1
 loader = (root/'src/clientscript/cscr_parser.cpp').read_text()
 assert loader.count('sourceBuf = Scr_AdjustDirectCoop(inst, extFilename, sourceBuf, &len);') == 2

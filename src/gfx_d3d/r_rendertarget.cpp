@@ -11,15 +11,20 @@
 ExtraCamSettings g_extraCamSettings;
 
 #ifdef NX_DXVK
-// Single-sampled, the scene's depth buffer is the floatz (INTZ) texture:
-// DXVK samples the bound depth buffer, so no RESZ copy is needed.
+// With r_intzSharedDepth, single-sampled, the scene's depth buffer is the
+// floatz (INTZ) texture: DXVK samples the bound depth buffer, so no RESZ copy
+// is needed. Off by default: water and mud sample floatz while that depth
+// buffer is still bound for their depth test, and on NVK they read no depth
+// and do not render. Otherwise floatz is its own INTZ texture, which
+// R_ResolveIntZ_PC fills with a RESZ copy after the opaque scene.
 bool g_nxIntZDepthBuffer;
 static IDirect3DTexture9 *s_nxIntZDepthTexture;
 
 static bool R_NX_CreateIntZDepthBuffer(int width, int height, IDirect3DSurface9 **surface)
 {
     const _D3DFORMAT FOURCC_INTZ = (_D3DFORMAT)1515474505;
-    if ( dx.multiSampleType != D3DMULTISAMPLE_NONE || g_allocateMinimalResources
+    if ( !r_intzSharedDepth->current.enabled
+        || dx.multiSampleType != D3DMULTISAMPLE_NONE || g_allocateMinimalResources
         || !r_floatz->current.enabled || !r_allow_intz->current.enabled
         || width != (int)vidConfig.sceneWidth || height != (int)vidConfig.sceneHeight
         || dx.d3d9->CheckDeviceFormat(dx.adapterIndex, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_DEPTHSTENCIL,
