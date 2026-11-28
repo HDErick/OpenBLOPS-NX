@@ -92,7 +92,14 @@ void __cdecl Cbuf_AddText(int localClientNum, const char *text)
     }
     else
     {
-        Com_Printf(16, "Cbuf_AddText: overflow\n");
+        // Name the dropped command, and only now and then: a line per call
+        // wrote 184,000 lines to the SD card log during one long map load.
+        static unsigned int overflows;
+        if ( (overflows++ & 1023) == 0 )
+        {
+            const int shown = (int)strcspn(text, "\n");
+            Com_Printf(16, "Cbuf_AddText: overflow (%u dropped so far): %.*s\n", overflows, shown < 80 ? shown : 80, text);
+        }
     }
     Sys_LeaveCriticalSection(CRITSECT_CBUF);
 }

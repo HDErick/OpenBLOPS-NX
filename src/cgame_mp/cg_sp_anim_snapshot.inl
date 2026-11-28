@@ -190,6 +190,13 @@ bool CG_ApplyRemoteAnimSnapshot_SP(int localClientNum, int entNum, DObj *obj, bo
 static bool SV_CopyActorStates_SP(SpAnimSnapshot::Frame &frame)
 {
     std::vector<SpAnimSnapshot::Actor> actors;
+    // The game is already shut down when a map change or quit sends its final
+    // snapshot (SV_FinalMessage): there are no actors to copy.
+    if (!sv.gameActors)
+    {
+        frame.actors.clear();
+        return true;
+    }
     for (int i = 0; i < MAX_ACTORS; ++i)
     {
         const actor_s *actor = reinterpret_cast<const actor_s *>(
