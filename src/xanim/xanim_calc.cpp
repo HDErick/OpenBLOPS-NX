@@ -5,12 +5,51 @@
 #include <clientscript/cscr_stringlist.h>
 #include <clientscript/scr_const.h>
 #include <game_mp/g_spawnsystem_mp.h>
+#include "dobj.h"
+
+// DObjCalcAnim checks bones that were filled in before it runs (ragdoll, bone
+// controllers, IK) for NaN or infinity. Retail compiled these checks out and
+// drew the bad bone for a frame; here they trapped and ended the game. Name
+// the bone, reset it to identity and carry on.
+static bool DObjCalcAnim_RepairBone(const DObj *obj, int bone, DObjAnimMat *mat)
+{
+    const bool badQuat = !isfinite(mat->quat[0]) || !isfinite(mat->quat[1]) || !isfinite(mat->quat[2]) || !isfinite(mat->quat[3]);
+    const bool badTrans = !isfinite(mat->trans[0]) || !isfinite(mat->trans[1]) || !isfinite(mat->trans[2]);
+    if ( !badQuat && !badTrans )
+        return false;
+    static int warnings;
+    if ( warnings < 16 )
+    {
+        ++warnings;
+        const char *model = "?";
+        int base = 0;
+        for ( int i = 0; i < obj->numModels; ++i )
+        {
+            if ( bone < base + obj->localModels[i]->numBones )
+            {
+                model = obj->localModels[i]->name;
+                break;
+            }
+            base += obj->localModels[i]->numBones;
+        }
+        Com_PrintWarning(19, "WARNING: model '%s' bone %d ('%s') has a non-finite %s; resetting it\n",
+            model, bone, DObjGetBoneName(obj, bone), badQuat ? "rotation" : "translation");
+    }
+    mat->quat[0] = 0.0f;
+    mat->quat[1] = 0.0f;
+    mat->quat[2] = 0.0f;
+    mat->quat[3] = 1.0f;
+    mat->trans[0] = 0.0f;
+    mat->trans[1] = 0.0f;
+    mat->trans[2] = 0.0f;
+    mat->transWeight = 2.0f;
+    return true;
+}
 
 void    DObjCalcAnim(DObj *obj, int *partBits)
 {
     void *v3; // esp
     const char *v4; // eax
-    const char *v5; // eax
     float v6; // [esp+30h] [ebp-7904h]
     float v7; // [esp+34h] [ebp-7900h]
     float v8; // [esp+38h] [ebp-78FCh]
@@ -76,34 +115,7 @@ LABEL_22:
         {
             //if ( bitarray<160>::testBit((bitarray<160> *)p_skel, n) )
             if (p_skel->partBits.anim.testBit(n))
-            {
-                if ( ((LODWORD(mat[n].quat[0]) & 0x7F800000) == 0x7F800000
-                     || (LODWORD(mat[n].quat[1]) & 0x7F800000) == 0x7F800000
-                     || (LODWORD(mat[n].quat[2]) & 0x7F800000) == 0x7F800000
-                     || (LODWORD(mat[n].quat[3]) & 0x7F800000) == 0x7F800000)
-                    && !Assert_MyHandler(
-                                "C:\\projects_pc\\cod\\codsrc\\src\\xanim\\xanim_calc.cpp",
-                                2197,
-                                0,
-                                "%s",
-                                "!IS_NAN((mat[bone].quat)[0]) && !IS_NAN((mat[bone].quat)[1]) && !IS_NAN((mat[bone].quat)[2]) && !IS_NAN("
-                                "(mat[bone].quat)[3])") )
-                {
-                    __debugbreak();
-                }
-                if ( ((LODWORD(mat[n].trans[0]) & 0x7F800000) == 0x7F800000
-                     || (LODWORD(mat[n].trans[1]) & 0x7F800000) == 0x7F800000
-                     || (LODWORD(mat[n].trans[2]) & 0x7F800000) == 0x7F800000)
-                    && !Assert_MyHandler(
-                                "C:\\projects_pc\\cod\\codsrc\\src\\xanim\\xanim_calc.cpp",
-                                2198,
-                                0,
-                                "%s",
-                                "!IS_NAN((mat[bone].trans)[0]) && !IS_NAN((mat[bone].trans)[1]) && !IS_NAN((mat[bone].trans)[2])") )
-                {
-                    __debugbreak();
-                }
-            }
+                DObjCalcAnim_RepairBone(obj, n, &mat[n]);
         }
         for ( ii = 0; ii < 5; ++ii )
             p_skel->partBits.anim[ii] |= partBits[ii];
@@ -147,33 +159,7 @@ LABEL_22:
                                             v4) )
                                 __debugbreak();
                         }
-                        if ( (LODWORD(v21->quat[0]) & 0x7F800000) == 0x7F800000
-                            || (LODWORD(v21->quat[1]) & 0x7F800000) == 0x7F800000
-                            || (LODWORD(v21->quat[2]) & 0x7F800000) == 0x7F800000
-                            || (LODWORD(v21->quat[3]) & 0x7F800000) == 0x7F800000 )
-                        {
-                            v5 = va("model %d: '%s'", kk, localModels[kk]->name);
-                            if ( !Assert_MyHandler(
-                                            "C:\\projects_pc\\cod\\codsrc\\src\\xanim\\xanim_calc.cpp",
-                                            2290,
-                                            0,
-                                            "%s\n\t%s",
-                                            "(!IS_NAN((mat->quat)[0]) && !IS_NAN((mat->quat)[1]) && !IS_NAN((mat->quat)[2]) && !IS_NAN((mat->quat)[3]))",
-                                            v5) )
-                                __debugbreak();
-                        }
-                        if ( ((LODWORD(v21->trans[0]) & 0x7F800000) == 0x7F800000
-                             || (LODWORD(v21->trans[1]) & 0x7F800000) == 0x7F800000
-                             || (LODWORD(v21->trans[2]) & 0x7F800000) == 0x7F800000)
-                            && !Assert_MyHandler(
-                                        "C:\\projects_pc\\cod\\codsrc\\src\\xanim\\xanim_calc.cpp",
-                                        2291,
-                                        0,
-                                        "%s",
-                                        "!IS_NAN((mat->trans)[0]) && !IS_NAN((mat->trans)[1]) && !IS_NAN((mat->trans)[2])") )
-                        {
-                            __debugbreak();
-                        }
+                        DObjCalcAnim_RepairBone(obj, v15, v21);
                     }
                 }
                 else
@@ -199,33 +185,7 @@ LABEL_22:
                 {
                     //if ( bitarray<160>::testBit((bitarray<160> *)p_skel, v15) )
                     if ( p_skel->partBits.anim.testBit(v15) )
-                    {
-                        if ( ((LODWORD(v21->quat[0]) & 0x7F800000) == 0x7F800000
-                             || (LODWORD(v21->quat[1]) & 0x7F800000) == 0x7F800000
-                             || (LODWORD(v21->quat[2]) & 0x7F800000) == 0x7F800000
-                             || (LODWORD(v21->quat[3]) & 0x7F800000) == 0x7F800000)
-                            && !Assert_MyHandler(
-                                        "C:\\projects_pc\\cod\\codsrc\\src\\xanim\\xanim_calc.cpp",
-                                        2316,
-                                        0,
-                                        "%s",
-                                        "!IS_NAN((mat->quat)[0]) && !IS_NAN((mat->quat)[1]) && !IS_NAN((mat->quat)[2]) && !IS_NAN((mat->quat)[3])") )
-                        {
-                            __debugbreak();
-                        }
-                        if ( ((LODWORD(v21->trans[0]) & 0x7F800000) == 0x7F800000
-                             || (LODWORD(v21->trans[1]) & 0x7F800000) == 0x7F800000
-                             || (LODWORD(v21->trans[2]) & 0x7F800000) == 0x7F800000)
-                            && !Assert_MyHandler(
-                                        "C:\\projects_pc\\cod\\codsrc\\src\\xanim\\xanim_calc.cpp",
-                                        2317,
-                                        0,
-                                        "%s",
-                                        "!IS_NAN((mat->trans)[0]) && !IS_NAN((mat->trans)[1]) && !IS_NAN((mat->trans)[2])") )
-                        {
-                            __debugbreak();
-                        }
-                    }
+                        DObjCalcAnim_RepairBone(obj, v15, v21);
                 }
                 else
                 {

@@ -458,6 +458,28 @@ static const char *nxExceptionName(u32 desc)
 
 static void nxCrashReport(ThreadExceptionDump *ctx);
 
+// Assert_MyHandler: the caller's code addresses, from the same stack scan as
+// the crash report, printed before the assert formats its message or traps.
+// An assert log used to end at its header with no clue to the caller.
+extern "C" void NX_LogAssertStack(void)
+{
+    MemoryInfo text = {}, stack = {};
+    u32 pageInfo;
+    svcQueryMemory(&text, &pageInfo, (u64)&NX_LogAssertStack);
+    const u64 textBase = text.addr, textEnd = text.addr + text.size;
+    const u64 *word = (const u64 *)__builtin_frame_address(0);
+    svcQueryMemory(&stack, &pageInfo, (u64)word);
+    const u64 *stackEnd = (const u64 *)(stack.addr + stack.size);
+    printf("Code addresses on the stack, innermost first (KisakBlack.elf offsets):\n");
+    for (int i = 0, found = 0; i < 4096 && word + i < stackEnd && found < 24; ++i) {
+        if (word[i] >= textBase && word[i] < textEnd) {
+            printf("  elf+0x%llx\n", (unsigned long long)(word[i] - textBase));
+            ++found;
+        }
+    }
+    fflush(stdout);
+}
+
 // Every thread's exception runs on the one __nx_exception_stack, with its dump
 // at the top. When a second thread faults while the first is reporting, its
 // entry overwrites that dump and the report's frames, and the log stopped

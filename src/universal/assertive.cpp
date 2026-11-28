@@ -581,6 +581,10 @@ void __cdecl Assert_SetMonkeyCallbackHandler(void (__cdecl *AssertCallbackFunc)(
     MonkeyAssertCallback = AssertCallbackFunc;
 }
 
+#ifdef KISAK_NX
+extern "C" void NX_LogAssertStack(void); // nx_main.cpp
+#endif
+
 bool Assert_MyHandler(const char *filename, int line, int type, const char *fmt, ...)
 {
 #if defined(OPENBLOPS_NO_STEAM_AUTH) && !defined(KISAK_NX)
@@ -646,6 +650,7 @@ bool Assert_MyHandler(const char *filename, int line, int type, const char *fmt,
         type,
         (unsigned)type < 3 ? assertTypeName[type] : "UNKNOWN");
     fflush(stdout);
+    NX_LogAssertStack();
 
     va_start(va, fmt);
     vsnprintf(message, sizeof(message), fmt, va);
